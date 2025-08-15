@@ -57,6 +57,7 @@ type CompactionInstruction struct {
 var (
 	diskConfig    Config
 	volumePath    string
+	volumeFile    *os.File // NOUVEAU : Descripteur de fichier global pour le volume .dat
 	volumeMutex   = &sync.Mutex{}
 	deletedChunks = make(map[uint64]uint32) // offset -> size
 	deletedMutex  = &sync.RWMutex{}
@@ -93,6 +94,16 @@ func main() {
 	log.Printf("Utilisation du fichier de volume : %s", volumePath)
 
 	ensureVolumeFile()
+
+	// MODIFIÉ : Ouvre le fichier de volume une seule fois au démarrage.
+	var err error
+	volumeFile, err = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		log.Fatalf("Impossible d'ouvrir le fichier de volume '%s': %v", volumePath, err)
+	}
+	// S'assure que le fichier est bien fermé à l'arrêt du programme.
+	defer volumeFile.Close()
+
 	loadDeletedChunks()
 	loadOrphanChunks()
 
@@ -130,7 +141,7 @@ func ensureVolumeFile() {
 		if err != nil {
 			log.Fatalf("Impossible de créer le fichier de volume : %v", err)
 		}
-		file.Close()
+		file.Close() // Fermer immédiatement après la création.
 	} else {
 		log.Printf("Fichier de volume existant trouvé : %s", volumePath)
 	}
@@ -394,7 +405,6 @@ func compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
 		log.Printf("Instruction de compactage reçue, mais aucun chunk à conserver. Le volume sera vidé.")
 	}
 
-	// Le tri par ancien offset est crucial pour une lecture séquentielle efficace
 	sort.Slice(chunksToKeep, func(i, j int) bool {
 		return chunksToKeep[i].Offset < chunksToKeep[j].Offset
 	})
@@ -402,32 +412,40 @@ func compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
 
+	// MODIFIÉ : Fermer le descripteur de fichier global avant de remplacer le fichier.
+	if err := volumeFile.Close(); err != nil {
+		log.Printf("AVERTISSEMENT: Impossible de fermer le descripteur de fichier du volume avant le compactage : %v", err)
+		// Essayer de le rouvrir pour maintenir la cohérence de l'état.
+		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		return nil, fmt.Errorf("impossible de fermer le descripteur de fichier existant: %w", err)
+	}
+
 	originalFile, err := os.Open(volumePath)
 	if err != nil {
+		// Essayer de rouvrir le descripteur principal avant de retourner l'erreur.
+		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
 		return nil, fmt.Errorf("impossible d'ouvrir le fichier original: %w", err)
 	}
 
 	tempPath := volumePath + ".tmp"
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
-		originalFile.Close() // Assurez-vous de fermer en cas d'erreur précoce
+		originalFile.Close()
+		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
 		return nil, fmt.Errorf("impossible de créer le fichier temporaire: %w", err)
 	}
 
 	offsetMapping := make(map[uint64]uint64)
 	var currentWriteOffset uint64 = 0
 
-	// Itérer à travers les chunks que le serveur nous a dit de conserver
 	for _, chunk := range chunksToKeep {
-		// Nous mappons l'ancien offset à la nouvelle position d'écriture actuelle
 		offsetMapping[chunk.Offset] = currentWriteOffset
-
-		// Nous copions ce chunk spécifique du fichier original vers le fichier temporaire
 		bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size)), int64(chunk.Size))
 		if err != nil {
 			tempFile.Close()
 			originalFile.Close()
 			os.Remove(tempPath)
+			volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
 			return nil, fmt.Errorf("erreur de copie du chunk (offset: %d, size: %d): %w", chunk.Offset, chunk.Size, err)
 		}
 		currentWriteOffset += uint64(bytesCopied)
@@ -436,21 +454,28 @@ func compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
 	originalFile.Close()
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
+		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
 		return nil, fmt.Errorf("erreur lors de la fermeture du fichier temporaire: %w", err)
 	}
 
-	// Remplacer l'ancien fichier de volume par le nouveau, compacté.
 	if err := os.Rename(tempPath, volumePath); err != nil {
 		os.Remove(tempPath)
+		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
 		return nil, fmt.Errorf("impossible de remplacer le fichier original: %w", err)
 	}
 
-	// Comme le compactage a réussi et est complet, nous pouvons maintenant vider la liste locale des chunks supprimés.
+	// MODIFIÉ : Rouvrir le descripteur de fichier global pour qu'il pointe vers le nouveau fichier compacté.
+	volumeFile, err = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		// C'est un état critique. Le volume n'est plus fonctionnel.
+		log.Fatalf("ERREUR CRITIQUE : Le fichier de volume a été remplacé mais impossible de le rouvrir : %v", err)
+	}
+
 	deletedMutex.Lock()
 	deletedCount := len(deletedChunks)
 	deletedChunks = make(map[uint64]uint32)
 	deletedMutex.Unlock()
-	saveDeletedChunks() // Sauvegarde la liste vide.
+	saveDeletedChunks()
 
 	log.Printf("Compactage instruit terminé : %d chunks conservés, %d anciens enregistrements de suppression purgés. %d mappings d'offset créés.", len(chunksToKeep), deletedCount, len(offsetMapping))
 	return offsetMapping, nil
@@ -496,14 +521,8 @@ func verifyChunkHandler(w http.ResponseWriter, r *http.Request) {
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
 
-	file, err := os.Open(volumePath)
-	if err != nil {
-		http.Error(w, "Erreur d'accès au volume", http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
+	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir le fichier.
+	fileInfo, err := volumeFile.Stat()
 	if err != nil {
 		http.Error(w, "Erreur de lecture des métadonnées du volume", http.StatusInternalServerError)
 		return
@@ -514,8 +533,9 @@ func verifyChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MODIFIÉ : Lecture depuis le descripteur de fichier global.
 	chunkData := make([]byte, size)
-	_, err = file.ReadAt(chunkData, int64(offset))
+	_, err = volumeFile.ReadAt(chunkData, int64(offset))
 	if err != nil {
 		http.Error(w, "Erreur de lecture du chunk", http.StatusInternalServerError)
 		return
@@ -579,22 +599,16 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
 
-	file, err := os.OpenFile(volumePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		log.Printf("ERREUR CRITIQUE: Impossible d'ouvrir le fichier de volume '%s': %v", volumePath, err)
-		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	offset, err := file.Seek(0, io.SeekEnd)
+	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir/fermer le fichier.
+	// On se positionne à la fin pour simuler un 'append'.
+	offset, err := volumeFile.Seek(0, io.SeekEnd)
 	if err != nil {
 		log.Printf("ERREUR CRITIQUE: Impossible de se positionner à la fin du volume: %v", err)
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 
-	bytesWritten, err := file.Write(chunkData)
+	bytesWritten, err := volumeFile.Write(chunkData)
 	if err != nil {
 		log.Printf("ERREUR CRITIQUE: Échec d'écriture sur le volume à l'offset %d: %v", offset, err)
 		orphanMutex.Lock()
@@ -626,41 +640,34 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := file.Sync(); err != nil {
+	// Forcer l'écriture sur le disque physique.
+	if err := volumeFile.Sync(); err != nil {
 		log.Printf("ERREUR CRITIQUE: Impossible de synchroniser les données sur disque: %v", err)
 	}
 
-	file.Close()
-
-	readFile, err := os.Open(volumePath)
+	// MODIFIÉ : Vérification en re-lisant depuis le même descripteur de fichier.
+	verifyData := make([]byte, bytesWritten)
+	_, err = volumeFile.ReadAt(verifyData, offset)
 	if err != nil {
-		log.Printf("ERREUR VERIFICATION: Impossible de rouvrir le volume pour vérification: %v", err)
+		log.Printf("ERREUR VERIFICATION: Impossible de relire le chunk écrit: %v", err)
 	} else {
-		verifyData := make([]byte, bytesWritten)
-		_, err = readFile.ReadAt(verifyData, offset)
-		readFile.Close()
+		verifyHash := sha256.Sum256(verifyData)
+		verifyChecksum := hex.EncodeToString(verifyHash[:])
 
-		if err != nil {
-			log.Printf("ERREUR VERIFICATION: Impossible de relire le chunk écrit: %v", err)
-		} else {
-			verifyHash := sha256.Sum256(verifyData)
-			verifyChecksum := hex.EncodeToString(verifyHash[:])
-
-			if verifyChecksum != expectedChecksum {
-				log.Printf("ERREUR CRITIQUE: Corruption détectée immédiatement après écriture!")
-				log.Printf("Checksum attendu: %s, checksum lu: %s", expectedChecksum, verifyChecksum)
-				orphanMutex.Lock()
-				orphanChunks[actualChecksum] = OrphanChunk{
-					Checksum: actualChecksum,
-					Offset:   uint64(offset),
-					Size:     uint32(bytesWritten),
-					Created:  time.Now(),
-				}
-				orphanMutex.Unlock()
-				saveOrphanChunks()
-				http.Error(w, "Corruption détectée après écriture", http.StatusInternalServerError)
-				return
+		if verifyChecksum != expectedChecksum {
+			log.Printf("ERREUR CRITIQUE: Corruption détectée immédiatement après écriture!")
+			log.Printf("Checksum attendu: %s, checksum lu: %s", expectedChecksum, verifyChecksum)
+			orphanMutex.Lock()
+			orphanChunks[actualChecksum] = OrphanChunk{
+				Checksum: actualChecksum,
+				Offset:   uint64(offset),
+				Size:     uint32(bytesWritten),
+				Created:  time.Now(),
 			}
+			orphanMutex.Unlock()
+			saveOrphanChunks()
+			http.Error(w, "Corruption détectée après écriture", http.StatusInternalServerError)
+			return
 		}
 	}
 
@@ -690,15 +697,8 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
 
-	file, err := os.Open(volumePath)
-	if err != nil {
-		log.Printf("ERREUR LECTURE: Impossible d'ouvrir le volume: %v", err)
-		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
+	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir le fichier.
+	fileInfo, err := volumeFile.Stat()
 	if err != nil {
 		log.Printf("ERREUR LECTURE: Impossible de lire les métadonnées du volume: %v", err)
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
@@ -712,8 +712,10 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MODIFIÉ : Lecture depuis le descripteur de fichier global.
+	// ReadAt est idéal car il ne modifie pas le curseur du fichier.
 	chunkData := make([]byte, size)
-	bytesRead, err := file.ReadAt(chunkData, offset)
+	bytesRead, err := volumeFile.ReadAt(chunkData, offset)
 	if err != nil {
 		log.Printf("ERREUR LECTURE: Échec de lecture à l'offset %d: %v", offset, err)
 		http.Error(w, "Erreur de lecture du chunk", http.StatusInternalServerError)
@@ -729,7 +731,6 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256(chunkData)
 	actualChecksum := hex.EncodeToString(hash[:])
 	w.Header().Set("X-Chunk-Checksum", actualChecksum)
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 
@@ -738,7 +739,6 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ERREUR LECTURE: Échec d'envoi des données au client: %v", err)
 		return
 	}
-
 	if bytesWritten != len(chunkData) {
 		log.Printf("ERREUR LECTURE: Envoi incomplet au client - envoyé:%d, total:%d",
 			bytesWritten, len(chunkData))
@@ -915,14 +915,12 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
-// Le handler de compactage reçoit maintenant les instructions du serveur et renvoie la map des offsets
 func compactHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Décoder les instructions du serveur
 	var instruction CompactionInstruction
 	if err := json.NewDecoder(r.Body).Decode(&instruction); err != nil {
 		http.Error(w, "Corps de requête JSON invalide: "+err.Error(), http.StatusBadRequest)
@@ -936,7 +934,6 @@ func compactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pour JSON, les clés de map doivent être des strings.
 	stringOffsetMap := make(map[string]uint64)
 	if offsetMap != nil {
 		for k, v := range offsetMap {
