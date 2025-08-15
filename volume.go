@@ -110,7 +110,9 @@ func getFreeSpaceBytes() uint64 {
 }
 
 func initialRegister() error {
+	// MODIFICATION: Ajout du champ "type" pour spécifier que c'est un enregistrement initial.
 	status := map[string]interface{}{
+		"type":       "initial",
 		"name":       diskConfig.Name,
 		"address":    diskConfig.Address,
 		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
@@ -147,7 +149,9 @@ func registerWithServer() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// MODIFICATION: Ajout du champ "type" pour spécifier que c'est un heartbeat.
 		status := map[string]interface{}{
+			"type":       "heartbeat",
 			"name":       diskConfig.Name,
 			"address":    diskConfig.Address,
 			"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
@@ -179,66 +183,51 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
 		return
 	}
-
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
-
 	file, err := os.OpenFile(volumePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
-
 	offset, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
-
 	bytesWritten, err := io.Copy(file, r.Body)
 	if err != nil {
 		http.Error(w, "Erreur lors de l'écriture du chunk", http.StatusInternalServerError)
 		return
 	}
-
-	response := map[string]interface{}{
-		"offset": offset,
-		"size":   bytesWritten,
-	}
+	response := map[string]interface{}{"offset": offset, "size": bytesWritten}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-
 	log.Printf("Chunk écrit avec succès (taille: %d, offset: %d)", bytesWritten, offset)
 }
 
 func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 	var offset, size int64
-	// CORRECTION: Utilisation de '=' au lieu de ':=' car les variables existent déjà.
 	_, errO := fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
 	_, errS := fmt.Sscanf(r.URL.Query().Get("size"), "%d", &size)
-
 	if errO != nil || errS != nil || size <= 0 {
 		http.Error(w, "Paramètres 'offset' et 'size' invalides", http.StatusBadRequest)
 		return
 	}
-
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
-
 	file, err := os.Open(volumePath)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
-
 	_, err = file.Seek(offset, io.SeekStart)
 	if err != nil {
 		http.Error(w, "Offset de lecture invalide", http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 	io.CopyN(w, file, size)
