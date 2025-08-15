@@ -17,8 +17,7 @@ import (
 
 // --- Constantes et Configuration ---
 const (
-	volumeFileName = "volume.dat"
-	volumeSizeGB   = 30
+	volumeSizeGB = 30
 )
 
 type Config struct {
@@ -38,7 +37,7 @@ var (
 
 func main() {
 	name := flag.String("name", "", "Nom unique du disque (requis)")
-	storage := flag.String("storage", ".", "Emplacement de stockage pour volume.dat")
+	storage := flag.String("storage", ".", "Emplacement de stockage pour le fichier de volume")
 	server := flag.String("server", "localhost:8080", "Adresse IP:port du serveur d'index")
 	address := flag.String("address", "localhost:9000", "Adresse IP:port de ce disque pour écouter")
 	flag.Parse()
@@ -48,12 +47,24 @@ func main() {
 	}
 
 	diskConfig = Config{
-		Name: *name, Storage: *storage, Server: *server, Address: *address,
+		Name:    *name,
+		Storage: *storage,
+		Server:  *server,
+		Address: *address,
 	}
+
+	volumeFileName := fmt.Sprintf("%s.dat", diskConfig.Name)
 	volumePath = filepath.Join(diskConfig.Storage, volumeFileName)
 
 	log.Printf("Démarrage du disque '%s' sur %s", diskConfig.Name, diskConfig.Address)
+	log.Printf("Utilisation du fichier de volume : %s", volumePath)
+
 	ensureVolumeFile()
+
+	if err := initialRegister(); err != nil {
+		log.Fatalf("Impossible de démarrer le volume. Erreur d'enregistrement : %v", err)
+	}
+
 	go registerWithServer()
 
 	http.HandleFunc("/write_chunk", writeChunkHandler)
@@ -61,7 +72,7 @@ func main() {
 
 	log.Printf("Disque '%s' en écoute sur http://%s", diskConfig.Name, diskConfig.Address)
 	if err := http.ListenAndServe(diskConfig.Address, nil); err != nil {
-		log.Fatalf("Le serveur du disque n'a pas pu démarrer: %v", err)
+		log.Fatalf("Le serveur du disque n'a pas pu démarrer : %v", err)
 	}
 }
 
@@ -69,27 +80,25 @@ func main() {
 
 func ensureVolumeFile() {
 	if err := os.MkdirAll(diskConfig.Storage, 0755); err != nil {
-		log.Fatalf("Impossible de créer le répertoire de stockage: %v", err)
+		log.Fatalf("Impossible de créer le répertoire de stockage : %v", err)
 	}
 	if _, err := os.Stat(volumePath); os.IsNotExist(err) {
-		log.Printf("Création du fichier de volume: %s", volumePath)
+		log.Printf("Création du fichier de volume : %s", volumePath)
 		file, err := os.Create(volumePath)
 		if err != nil {
-			log.Fatalf("Impossible de créer le fichier de volume: %v", err)
+			log.Fatalf("Impossible de créer le fichier de volume : %v", err)
 		}
 		file.Close()
 	} else {
-		log.Printf("Fichier de volume existant trouvé: %s", volumePath)
+		log.Printf("Fichier de volume existant trouvé : %s", volumePath)
 	}
 }
 
-// getFreeSpaceBytes calcule et retourne l'espace libre en bytes.
 func getFreeSpaceBytes() uint64 {
 	totalBytes := uint64(volumeSizeGB) * 1024 * 1024 * 1024
 
 	fileInfo, err := os.Stat(volumePath)
 	if err != nil {
-		// Si le fichier n'existe pas ou est inaccessible, on suppose qu'il est vide.
 		return totalBytes
 	}
 
@@ -100,11 +109,44 @@ func getFreeSpaceBytes() uint64 {
 	return totalBytes - usedBytes
 }
 
+func initialRegister() error {
+	status := map[string]interface{}{
+		"name":       diskConfig.Name,
+		"address":    diskConfig.Address,
+		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
+		"freeSpace":  getFreeSpaceBytes(),
+	}
+
+	payload, err := json.Marshal(status)
+	if err != nil {
+		return fmt.Errorf("impossible de construire la charge utile JSON : %v", err)
+	}
+
+	serverURL := fmt.Sprintf("http://%s/api/disk/register", diskConfig.Server)
+	resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("erreur de connexion au serveur %s : %v", diskConfig.Server, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Println("Enregistrement initial auprès du serveur réussi.")
+		return nil
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("conflit de nom : %s", string(bodyBytes))
+	}
+
+	return fmt.Errorf("le serveur a répondu avec un statut inattendu %s. Réponse : %s", resp.Status, string(bodyBytes))
+}
+
 func registerWithServer() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for {
+	for range ticker.C {
 		status := map[string]interface{}{
 			"name":       diskConfig.Name,
 			"address":    diskConfig.Address,
@@ -117,20 +159,15 @@ func registerWithServer() {
 
 		resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
 		if err != nil {
-			log.Printf("Erreur de connexion au serveur %s: %v", diskConfig.Server, err)
+			log.Printf("Erreur de connexion au serveur %s : %v", diskConfig.Server, err)
 		} else {
 			if resp.StatusCode != http.StatusOK {
 				bodyBytes, _ := io.ReadAll(resp.Body)
-				log.Printf("Le serveur a répondu avec un statut non-OK: %s. Réponse: %s", resp.Status, string(bodyBytes))
+				log.Printf("Le serveur a répondu avec un statut non-OK lors du heartbeat : %s. Réponse : %s", resp.Status, string(bodyBytes))
 			} else {
 				log.Printf("Heartbeat envoyé au serveur avec succès.")
 			}
 			resp.Body.Close()
-		}
-
-		// Attendre le prochain tick
-		if _, ok := <-ticker.C; !ok {
-			return // Le ticker a été arrêté, la goroutine se termine.
 		}
 	}
 }
@@ -177,6 +214,7 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 
 func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 	var offset, size int64
+	// CORRECTION: Utilisation de '=' au lieu de ':=' car les variables existent déjà.
 	_, errO := fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
 	_, errS := fmt.Sscanf(r.URL.Query().Get("size"), "%d", &size)
 
