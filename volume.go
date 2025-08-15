@@ -43,6 +43,17 @@ type OrphanChunk struct {
 	Created  time.Time
 }
 
+// Structure pour un chunk à conserver, utilisée dans les instructions de compactage
+type ChunkToKeep struct {
+	Offset uint64 `json:"offset"`
+	Size   uint32 `json:"size"`
+}
+
+// Structure pour les instructions de compactage reçues du serveur
+type CompactionInstruction struct {
+	ChunksToKeep []ChunkToKeep `json:"chunks_to_keep"`
+}
+
 var (
 	diskConfig    Config
 	volumePath    string
@@ -375,29 +386,17 @@ func registerWithServer() {
 	}
 }
 
-// CORRECTION: Fonction de compactage entièrement réécrite pour retourner la map des offsets
-func compactVolume() (map[uint64]uint64, error) {
-	log.Printf("Début du compactage du volume '%s'", diskConfig.Name)
+// La fonction de compactage est maintenant pilotée par les instructions du serveur.
+func compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
+	log.Printf("Début du compactage instruit par le serveur pour le volume '%s'", diskConfig.Name)
 
-	deletedMutex.RLock()
-	if len(deletedChunks) == 0 {
-		deletedMutex.RUnlock()
-		log.Printf("Aucun chunk à supprimer, compactage ignoré.")
-		return nil, nil
+	if len(chunksToKeep) == 0 {
+		log.Printf("Instruction de compactage reçue, mais aucun chunk à conserver. Le volume sera vidé.")
 	}
 
-	type deletedRegion struct {
-		offset uint64
-		size   uint32
-	}
-	var deletedRegions []deletedRegion
-	for offset, size := range deletedChunks {
-		deletedRegions = append(deletedRegions, deletedRegion{offset, size})
-	}
-	deletedMutex.RUnlock()
-
-	sort.Slice(deletedRegions, func(i, j int) bool {
-		return deletedRegions[i].offset < deletedRegions[j].offset
+	// Le tri par ancien offset est crucial pour une lecture séquentielle efficace
+	sort.Slice(chunksToKeep, func(i, j int) bool {
+		return chunksToKeep[i].Offset < chunksToKeep[j].Offset
 	})
 
 	volumeMutex.Lock()
@@ -407,72 +406,55 @@ func compactVolume() (map[uint64]uint64, error) {
 	if err != nil {
 		return nil, fmt.Errorf("impossible d'ouvrir le fichier original: %w", err)
 	}
-	defer originalFile.Close()
-
-	fileInfo, err := originalFile.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("impossible de lire les métadonnées du fichier original: %w", err)
-	}
-	originalSize := uint64(fileInfo.Size())
 
 	tempPath := volumePath + ".tmp"
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
+		originalFile.Close() // Assurez-vous de fermer en cas d'erreur précoce
 		return nil, fmt.Errorf("impossible de créer le fichier temporaire: %w", err)
 	}
-	defer tempFile.Close()
 
 	offsetMapping := make(map[uint64]uint64)
-	var currentReadOffset uint64 = 0
 	var currentWriteOffset uint64 = 0
 
-	for _, region := range deletedRegions {
-		validBlockSize := region.offset - currentReadOffset
-		if validBlockSize > 0 {
-			// Enregistrer le mapping pour le début de ce bloc valide
-			offsetMapping[currentReadOffset] = currentWriteOffset
+	// Itérer à travers les chunks que le serveur nous a dit de conserver
+	for _, chunk := range chunksToKeep {
+		// Nous mappons l'ancien offset à la nouvelle position d'écriture actuelle
+		offsetMapping[chunk.Offset] = currentWriteOffset
 
-			// Copier le bloc de données valide
-			bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(currentReadOffset), int64(validBlockSize)), int64(validBlockSize))
-			if err != nil {
-				os.Remove(tempPath)
-				return nil, fmt.Errorf("erreur de copie du bloc valide: %w", err)
-			}
-			currentWriteOffset += uint64(bytesCopied)
-		}
-		// Sauter par-dessus la région supprimée
-		currentReadOffset = region.offset + uint64(region.size)
-	}
-
-	// Copier le dernier bloc de données valide (s'il existe) après la dernière région supprimée
-	if currentReadOffset < originalSize {
-		offsetMapping[currentReadOffset] = currentWriteOffset
-		bytesCopied, err := io.Copy(tempFile, io.NewSectionReader(originalFile, int64(currentReadOffset), int64(originalSize-currentReadOffset)))
+		// Nous copions ce chunk spécifique du fichier original vers le fichier temporaire
+		bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size)), int64(chunk.Size))
 		if err != nil {
+			tempFile.Close()
+			originalFile.Close()
 			os.Remove(tempPath)
-			return nil, fmt.Errorf("erreur de copie du dernier bloc: %w", err)
+			return nil, fmt.Errorf("erreur de copie du chunk (offset: %d, size: %d): %w", chunk.Offset, chunk.Size, err)
 		}
 		currentWriteOffset += uint64(bytesCopied)
 	}
-	
-	originalFile.Close()
-	tempFile.Close()
 
+	originalFile.Close()
+	if err := tempFile.Close(); err != nil {
+		os.Remove(tempPath)
+		return nil, fmt.Errorf("erreur lors de la fermeture du fichier temporaire: %w", err)
+	}
+
+	// Remplacer l'ancien fichier de volume par le nouveau, compacté.
 	if err := os.Rename(tempPath, volumePath); err != nil {
 		os.Remove(tempPath)
 		return nil, fmt.Errorf("impossible de remplacer le fichier original: %w", err)
 	}
 
+	// Comme le compactage a réussi et est complet, nous pouvons maintenant vider la liste locale des chunks supprimés.
 	deletedMutex.Lock()
 	deletedCount := len(deletedChunks)
 	deletedChunks = make(map[uint64]uint32)
 	deletedMutex.Unlock()
-	saveDeletedChunks()
+	saveDeletedChunks() // Sauvegarde la liste vide.
 
-	log.Printf("Compactage terminé : %d chunks supprimés, fichier optimisé. %d mappings d'offset créés.", deletedCount, len(offsetMapping))
+	log.Printf("Compactage instruit terminé : %d chunks conservés, %d anciens enregistrements de suppression purgés. %d mappings d'offset créés.", len(chunksToKeep), deletedCount, len(offsetMapping))
 	return offsetMapping, nil
 }
-
 
 // --- Handlers HTTP ---
 
@@ -933,24 +915,39 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(health)
 }
 
-// CORRECTION: Le handler de compactage renvoie maintenant la map des offsets
+// Le handler de compactage reçoit maintenant les instructions du serveur et renvoie la map des offsets
 func compactHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
 		return
 	}
 
-	offsetMap, err := compactVolume()
+	// Décoder les instructions du serveur
+	var instruction CompactionInstruction
+	if err := json.NewDecoder(r.Body).Decode(&instruction); err != nil {
+		http.Error(w, "Corps de requête JSON invalide: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	offsetMap, err := compactVolume(instruction.ChunksToKeep)
 	if err != nil {
 		log.Printf("Erreur lors du compactage : %v", err)
 		http.Error(w, "Erreur interne lors du compactage", http.StatusInternalServerError)
 		return
 	}
 
+	// Pour JSON, les clés de map doivent être des strings.
+	stringOffsetMap := make(map[string]uint64)
+	if offsetMap != nil {
+		for k, v := range offsetMap {
+			stringOffsetMap[strconv.FormatUint(k, 10)] = v
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":     "Compactage terminé",
-		"offset_map": offsetMap,
+		"offset_map": stringOffsetMap,
 	})
 }
