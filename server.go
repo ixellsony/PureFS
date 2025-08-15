@@ -16,7 +16,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.comc/gorilla/mux"
+	"github.com/gorilla/mux"
 )
 
 // --- Constantes et Configuration ---
@@ -27,17 +27,15 @@ const (
 
 // --- Structures de Données ---
 
-// IndexEntry décrit un unique chunk de fichier.
 type IndexEntry struct {
-	ChunkID  uint64 // ID unique pour ce chunk
-	DiskName string // Nom du disque qui le stocke
-	Offset   uint64 // Offset dans le volume.dat du disque
-	Size     uint32 // Taille réelle du chunk en bytes
-	ChunkIdx int    // Position du chunk dans le fichier (0, 1, 2...)
-	Status   byte   // 1: OK, 2: Indisponible, etc.
+	ChunkID  uint64
+	DiskName string
+	Offset   uint64
+	Size     uint32
+	ChunkIdx int
+	Status   byte
 }
 
-// FileMetadata contient la liste des chunks pour un fichier.
 type FileMetadata struct {
 	FileName   string
 	TotalSize  int64
@@ -45,7 +43,12 @@ type FileMetadata struct {
 	Chunks     []*IndexEntry
 }
 
-// Disk représente un nœud de stockage. Les tailles sont en bytes.
+// MODIFICATION 1: Ajout de la méthode d'aide pour le template
+// TotalSizeMB convertit la taille totale en bytes (int64) vers des méga-octets (float64)
+func (fm *FileMetadata) TotalSizeMB() float64 {
+	return float64(fm.TotalSize) / (1024 * 1024)
+}
+
 type Disk struct {
 	Name       string    `json:"name"`
 	Address    string    `json:"address"`
@@ -54,16 +57,14 @@ type Disk struct {
 	LastSeen   time.Time `json:"-"`
 }
 
-// FreeSpaceGB est une méthode d'aide pour convertir les bytes en GB pour l'affichage.
 func (d *Disk) FreeSpaceGB() float64 {
 	return float64(d.FreeSpace) / (1024 * 1024 * 1024)
 }
 
-// GlobalState contient l'état complet du serveur.
 type GlobalState struct {
 	sync.RWMutex
-	FileIndex       map[string]*FileMetadata // Clé: nom du fichier
-	RegisteredDisks map[string]*Disk       // Clé: nom du disque
+	FileIndex       map[string]*FileMetadata
+	RegisteredDisks map[string]*Disk
 	nextDiskIdx     int
 }
 
@@ -98,12 +99,11 @@ func main() {
 	}
 }
 
-// --- Gestion de l'Index (Persistance) ---
+// --- Le reste du fichier est identique ---
 
 func loadIndex() {
 	state.Lock()
 	defer state.Unlock()
-
 	file, err := os.Open(indexFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -113,7 +113,6 @@ func loadIndex() {
 		log.Fatalf("Erreur à l'ouverture du fichier d'index: %v", err)
 	}
 	defer file.Close()
-
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&state.FileIndex); err != nil {
 		log.Printf("Erreur au décodage de l'index: %v. L'index sera réinitialisé.", err)
@@ -126,42 +125,34 @@ func loadIndex() {
 func saveIndex() {
 	state.RLock()
 	defer state.RUnlock()
-
 	file, err := os.Create(indexFilePath)
 	if err != nil {
 		log.Printf("ERREUR: Impossible de sauvegarder l'index: %v", err)
 		return
 	}
 	defer file.Close()
-
 	encoder := gob.NewEncoder(file)
 	if err := encoder.Encode(state.FileIndex); err != nil {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
 	}
 }
 
-// --- Logique Métier ---
-
 func selectDisk() *Disk {
 	state.Lock()
 	defer state.Unlock()
-
 	if len(state.RegisteredDisks) == 0 {
 		return nil
 	}
-
 	var disks []*Disk
 	for _, d := range state.RegisteredDisks {
 		disks = append(disks, d)
 	}
 	sort.Slice(disks, func(i, j int) bool { return disks[i].Name < disks[j].Name })
-
 	if state.nextDiskIdx >= len(disks) {
 		state.nextDiskIdx = 0
 	}
 	selected := disks[state.nextDiskIdx]
 	state.nextDiskIdx++
-
 	return selected
 }
 
@@ -179,20 +170,16 @@ func cleanupInactiveDisks() {
 	}
 }
 
-// --- Handlers HTTP ---
-
 func registerDiskHandler(w http.ResponseWriter, r *http.Request) {
 	var disk Disk
 	if err := json.NewDecoder(r.Body).Decode(&disk); err != nil {
 		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
 	state.Lock()
 	disk.LastSeen = time.Now()
 	state.RegisteredDisks[disk.Name] = &disk
 	state.Unlock()
-
 	log.Printf("Disque enregistré/mis à jour: %s à l'adresse %s", disk.Name, disk.Address)
 	w.WriteHeader(http.StatusOK)
 }
@@ -203,7 +190,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Erreur de lecture du formulaire multipart: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	part, err := mr.NextPart()
 	if err != nil {
 		http.Error(w, "Aucun fichier trouvé dans la requête: "+err.Error(), http.StatusBadRequest)
@@ -215,7 +201,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Début de l'upload pour: %s", fileName)
-
 	state.RLock()
 	_, exists := state.FileIndex[fileName]
 	state.RUnlock()
@@ -223,15 +208,12 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Un fichier avec ce nom existe déjà.", http.StatusConflict)
 		return
 	}
-
 	var chunks []*IndexEntry
 	var totalSize int64
 	chunkIdx := 0
 	for {
 		buffer := make([]byte, chunkSize)
 		bytesRead, readErr := io.ReadFull(part, buffer)
-
-		// Gérer la fin de fichier
 		if readErr == io.EOF {
 			break
 		}
@@ -241,29 +223,24 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Erreur de lecture du chunk: "+readErr.Error(), http.StatusInternalServerError)
 			return
 		}
-
 		targetDisk := selectDisk()
 		if targetDisk == nil {
 			http.Error(w, "Aucun disque de stockage disponible.", http.StatusServiceUnavailable)
 			return
 		}
-
 		diskURL := fmt.Sprintf("http://%s/write_chunk", targetDisk.Address)
 		req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(buffer))
 		req.Header.Set("Content-Type", "application/octet-stream")
-
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			http.Error(w, "Erreur interne du serveur (disque injoignable)", http.StatusInternalServerError)
 			return
 		}
 		defer resp.Body.Close()
-
 		if resp.StatusCode != http.StatusOK {
 			http.Error(w, "Erreur interne du serveur (le disque a refusé l'écriture)", http.StatusInternalServerError)
 			return
 		}
-
 		var writeResp struct {
 			Offset uint64 `json:"offset"`
 			Size   uint32 `json:"size"`
@@ -272,7 +249,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Erreur interne du serveur (réponse du disque invalide)", http.StatusInternalServerError)
 			return
 		}
-
 		entry := &IndexEntry{
 			ChunkID:  uint64(time.Now().UnixNano()) + uint64(rand.Int()),
 			DiskName: targetDisk.Name,
@@ -284,12 +260,10 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		chunks = append(chunks, entry)
 		totalSize += int64(writeResp.Size)
 		chunkIdx++
-
 		if readErr == io.ErrUnexpectedEOF {
 			break
 		}
 	}
-
 	state.Lock()
 	state.FileIndex[fileName] = &FileMetadata{
 		FileName:   fileName,
@@ -298,7 +272,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		Chunks:     chunks,
 	}
 	state.Unlock()
-
 	saveIndex()
 	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé avec succès.", fileName, totalSize, len(chunks))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -307,7 +280,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
-
 	state.RLock()
 	meta, ok := state.FileIndex[filename]
 	if !ok {
@@ -318,34 +290,28 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	chunks := make([]*IndexEntry, len(meta.Chunks))
 	copy(chunks, meta.Chunks)
 	state.RUnlock()
-
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.TotalSize))
-
 	for _, chunk := range chunks {
 		state.RLock()
 		disk, diskOK := state.RegisteredDisks[chunk.DiskName]
 		state.RUnlock()
-
 		if !diskOK {
 			http.Error(w, "Une partie du fichier est indisponible (disque manquant)", http.StatusServiceUnavailable)
 			return
 		}
-
 		diskURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", disk.Address, chunk.Offset, chunk.Size)
 		resp, err := http.Get(diskURL)
 		if err != nil {
 			http.Error(w, "Erreur de lecture d'une partie du fichier", http.StatusInternalServerError)
 			return
 		}
-		
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			http.Error(w, "Erreur de lecture d'une partie du fichier (le disque a échoué)", http.StatusInternalServerError)
 			return
 		}
-
 		_, err = io.Copy(w, resp.Body)
 		resp.Body.Close()
 		if err != nil {
@@ -357,20 +323,16 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	state.RLock()
 	defer state.RUnlock()
-
 	disks := make([]*Disk, 0, len(state.RegisteredDisks))
 	for _, d := range state.RegisteredDisks {
 		disks = append(disks, d)
 	}
-
 	files := make([]*FileMetadata, 0, len(state.FileIndex))
 	for _, f := range state.FileIndex {
 		files = append(files, f)
 	}
-
 	sort.Slice(disks, func(i, j int) bool { return disks[i].Name < disks[j].Name })
 	sort.Slice(files, func(i, j int) bool { return files[i].UploadDate.After(files[j].UploadDate) })
-
 	data := struct {
 		Disks []*Disk
 		Files []*FileMetadata
@@ -378,13 +340,13 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 		Disks: disks,
 		Files: files,
 	}
-
 	err := webTemplate.Execute(w, data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
+// MODIFICATION 2: Le template utilise maintenant la méthode .TotalSizeMB
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
@@ -435,7 +397,7 @@ const htmlTemplate = `
                     {{range .Files}}
                         <tr>
                             <td>{{.FileName}}</td>
-                            <td>{{printf "%.2f" (float64 .TotalSize / 1048576.0)}}</td>
+                            <td>{{.TotalSizeMB | printf "%.2f"}}</td>
                             <td>{{len .Chunks}}</td>
                             <td>{{.UploadDate.Format "02/01/2006 15:04"}}</td>
                             <td><a href="/api/files/download/{{.FileName}}" class="btn btn-download">Télécharger</a></td>
