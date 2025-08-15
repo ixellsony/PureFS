@@ -235,6 +235,10 @@ func applyOffsetMaps(journalData *GCJournal) {
 			}
 			for _, chunkMeta := range fileMeta.Chunks {
 				for _, copyInfo := range chunkMeta.Copies {
+					if copyInfo.Deleted {
+						continue
+					}
+
 					if copyInfo.VolumeName == volumeName {
 						if newOffset, ok := findNewOffset(copyInfo.Offset, offsetMap); ok {
 							if newOffset != copyInfo.Offset {
@@ -597,9 +601,54 @@ func runGarbageCollection() {
 		wg.Add(1)
 		go func(volume *Volume) {
 			defer wg.Done()
+
+			// ### CORRECTION : Le serveur devient la source de vérité ###
+			// Construire la liste exacte des chunks que le volume doit conserver.
+			log.Printf("GC: Construction de la liste des chunks à conserver pour le volume '%s'...", volume.Name)
+
+			type ChunkToKeep struct {
+				Offset uint64 `json:"offset"`
+				Size   uint32 `json:"size"`
+			}
+			var chunksToKeep []ChunkToKeep
+
+			fileIndexMutex.RLock()
+			for _, fileMeta := range fileIndex {
+				// On ne s'intéresse qu'aux fichiers actifs
+				if fileMeta.Deleted {
+					continue
+				}
+				for _, chunkMeta := range fileMeta.Chunks {
+					for _, copyInfo := range chunkMeta.Copies {
+						// On cherche les chunks qui sont sur le volume actuel et ne sont pas supprimés
+						if copyInfo.VolumeName == volume.Name && !copyInfo.Deleted {
+							chunksToKeep = append(chunksToKeep, ChunkToKeep{
+								Offset: copyInfo.Offset,
+								Size:   copyInfo.Size,
+							})
+						}
+					}
+				}
+			}
+			fileIndexMutex.RUnlock()
+
+			log.Printf("GC: Volume '%s' doit conserver %d chunks.", volume.Name, len(chunksToKeep))
+
+			// Préparer le corps de la requête pour le volume
+			requestBody, err := json.Marshal(struct {
+				ChunksToKeep []ChunkToKeep `json:"chunks_to_keep"`
+			}{ChunksToKeep: chunksToKeep})
+
+			if err != nil {
+				log.Printf("Erreur de sérialisation des instructions de compactage pour '%s': %v", volume.Name, err)
+				return
+			}
+
 			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
-			client := &http.Client{Timeout: 15 * time.Minute}
-			resp, err := client.Post(compactURL, "application/json", nil)
+			client := &http.Client{Timeout: 15 * time.Minute} // Le compactage peut être long
+
+			// Envoyer la commande de compactage avec la liste précise des chunks à conserver
+			resp, err := client.Post(compactURL, "application/json", bytes.NewBuffer(requestBody))
 			if err != nil {
 				log.Printf("Erreur lors de la demande de compactage au volume '%s': %v", volume.Name, err)
 				return
