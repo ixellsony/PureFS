@@ -1,9 +1,10 @@
-// server.go
 package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +30,7 @@ const (
 // --- Structures de Données ---
 
 type ChunkCopy struct {
-	VolumeName string // Nom du volume, ex: "volume1"
+	VolumeName string
 	Offset     uint64
 	Size       uint32
 }
@@ -37,6 +38,7 @@ type ChunkCopy struct {
 type ChunkMetadata struct {
 	ChunkIdx int
 	Copies   []*ChunkCopy
+	Checksum string
 }
 
 type FileMetadata struct {
@@ -44,10 +46,7 @@ type FileMetadata struct {
 	TotalSize  int64
 	UploadDate time.Time
 	Chunks     []*ChunkMetadata
-	// Champs volatiles pour l'UI
-	Status         string `json:"-"` // "Protégé", "Dégradé", "Indisponible"
-	HealthyCopies  int    `json:"-"`
-	RequiredCopies int    `json:"-"`
+	Status     string `json:"-"`
 }
 
 func (fm *FileMetadata) TotalSizeMB() float64 {
@@ -55,14 +54,14 @@ func (fm *FileMetadata) TotalSizeMB() float64 {
 }
 
 type Volume struct {
-	Name       string    `json:"name"`
-	DiskID     string    `json:"diskId"` // NOUVEAU: ID du disque physique
-	Address    string    `json:"address"`
-	TotalSpace uint64    `json:"totalSpace"`
-	FreeSpace  uint64    `json:"freeSpace"`
+	Name       string
+	DiskID     string
+	Address    string
+	TotalSpace uint64
+	FreeSpace  uint64
 	LastSeen   time.Time `json:"-"`
-	Status     string    `json:"status"` // "En ligne" ou "Hors ligne"
-	Type       string    `json:"type,omitempty"`
+	Status     string
+	Type       string `json:"type,omitempty"`
 }
 
 func (v *Volume) FreeSpaceGB() float64 {
@@ -97,7 +96,7 @@ func main() {
 	r.HandleFunc("/api/disk/register", registerVolumeHandler).Methods("POST")
 	r.HandleFunc("/api/files/upload", uploadFileHandler).Methods("POST")
 	r.HandleFunc("/api/files/download/{filename}", downloadFileHandler).Methods("GET")
-	r.HandleFunc("/api/repair", repairHandler).Methods("POST") // NOUVELLE ROUTE
+	r.HandleFunc("/api/repair", repairHandler).Methods("POST")
 	r.HandleFunc("/", webUIHandler).Methods("GET")
 
 	log.Println("Serveur de stockage démarré sur http://localhost:8080")
@@ -137,12 +136,11 @@ func saveIndex() {
 	}
 	defer file.Close()
 	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(state.FileIndex); err != nil {
+	if err := encoder.Encode(&state.FileIndex); err != nil {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
 	}
 }
 
-// NOUVELLE LOGIQUE DE SÉLECTION: Sélectionne N volumes sur des disques physiques différents.
 func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, error) {
 	state.RLock()
 	defer state.RUnlock()
@@ -154,7 +152,6 @@ func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, e
 		}
 	}
 
-	// Grouper les volumes par leur disque physique parent
 	volumesByDiskID := make(map[string][]*Volume)
 	for _, v := range onlineVolumes {
 		isExcluded := false
@@ -173,7 +170,6 @@ func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, e
 		return nil, fmt.Errorf("pas assez de disques physiques uniques disponibles (requis: %d, dispo: %d)", count, len(volumesByDiskID))
 	}
 
-	// Sélectionner les disques physiques à utiliser
 	var availableDiskIDs []string
 	for diskID := range volumesByDiskID {
 		availableDiskIDs = append(availableDiskIDs, diskID)
@@ -185,7 +181,6 @@ func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, e
 	selectedDisks := availableDiskIDs[:count]
 	var result []*Volume
 	for _, diskID := range selectedDisks {
-		// Choisir un volume au hasard sur ce disque
 		volumesOnThisDisk := volumesByDiskID[diskID]
 		selectedVolume := volumesOnThisDisk[rand.Intn(len(volumesOnThisDisk))]
 		result = append(result, selectedVolume)
@@ -303,7 +298,7 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 
 		isLastChunk := false
 		if readErr == io.EOF {
-			break // Fichier vide ou terminé parfaitement à la fin du chunk précédent
+			break
 		}
 		if readErr == io.ErrUnexpectedEOF {
 			buffer = buffer[:bytesRead]
@@ -313,6 +308,9 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		hash := sha256.Sum256(buffer)
+		checksum := hex.EncodeToString(hash[:])
+
 		targetVolumes, err := selectVolumesForReplication(requiredReplicas, nil)
 		if err != nil {
 			log.Printf("ERREUR UPLOAD: Impossible de trouver des volumes pour la réplication: %v", err)
@@ -320,8 +318,8 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("Chunk %d: écriture sur %s (disque %s) et %s (disque %s)",
-			chunkIdx, targetVolumes[0].Name, targetVolumes[0].DiskID, targetVolumes[1].Name, targetVolumes[1].DiskID)
+		log.Printf("Chunk %d (checksum: %s...): écriture sur %s et %s",
+			chunkIdx, checksum[:8], targetVolumes[0].Name, targetVolumes[1].Name)
 
 		var wg sync.WaitGroup
 		results := make(chan *ChunkCopy, requiredReplicas)
@@ -334,14 +332,18 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 				diskURL := fmt.Sprintf("http://%s/write_chunk", v.Address)
 				req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(buffer))
 				req.Header.Set("Content-Type", "application/octet-stream")
+				req.Header.Set("X-Chunk-Checksum", checksum)
+
 				resp, err := http.DefaultClient.Do(req)
 				if err != nil {
 					errs <- fmt.Errorf("volume '%s' injoignable: %w", v.Name, err)
 					return
 				}
 				defer resp.Body.Close()
+
 				if resp.StatusCode != http.StatusOK {
-					errs <- fmt.Errorf("le volume '%s' a refusé l'écriture", v.Name)
+					body, _ := io.ReadAll(resp.Body)
+					errs <- fmt.Errorf("le volume '%s' a refusé l'écriture (status: %d): %s", v.Name, resp.StatusCode, string(body))
 					return
 				}
 				var writeResp struct {
@@ -372,7 +374,11 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fileChunks = append(fileChunks, &ChunkMetadata{ChunkIdx: chunkIdx, Copies: successfulCopies})
+		fileChunks = append(fileChunks, &ChunkMetadata{
+			ChunkIdx: chunkIdx,
+			Copies:   successfulCopies,
+			Checksum: checksum,
+		})
 		totalSize += int64(successfulCopies[0].Size)
 		chunkIdx++
 
@@ -415,6 +421,8 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	for _, chunk := range chunks {
 		var readSuccessful bool
 		var lastError error
+		expectedChecksum := chunk.Checksum
+
 		for _, copyInfo := range chunk.Copies {
 			state.RLock()
 			volume, volOK := state.RegisteredVolumes[copyInfo.VolumeName]
@@ -428,49 +436,63 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 			diskURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", volume.Address, copyInfo.Offset, copyInfo.Size)
 			resp, err := http.Get(diskURL)
 			if err != nil {
-				lastError = fmt.Errorf("erreur de connexion à '%s'", volume.Name)
-				continue
-			}
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				lastError = fmt.Errorf("échec de lecture sur '%s'", volume.Name)
+				lastError = fmt.Errorf("erreur de connexion à '%s': %w", volume.Name, err)
 				continue
 			}
 
-			_, err = io.Copy(w, resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				lastError = fmt.Errorf("échec de lecture sur '%s' (status: %d)", volume.Name, resp.StatusCode)
+				continue
+			}
+
+			chunkData, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if err != nil {
+				lastError = fmt.Errorf("erreur de lecture du corps de la réponse de '%s': %w", volume.Name, err)
+				continue
+			}
+
+			hash := sha256.Sum256(chunkData)
+			actualChecksum := hex.EncodeToString(hash[:])
+
+			if actualChecksum != expectedChecksum {
+				log.Printf("!!! CORRUPTION DETECTEE !!! Chunk %d de '%s' sur volume '%s'. Attendu: %s, Reçu: %s",
+					chunk.ChunkIdx, filename, volume.Name, expectedChecksum, actualChecksum)
+				lastError = fmt.Errorf("corruption de données sur '%s'", volume.Name)
+				continue
+			}
+
+			if _, err := w.Write(chunkData); err != nil {
 				log.Printf("Erreur d'envoi du chunk au client: %v", err)
 				return
 			}
+
 			readSuccessful = true
 			break
 		}
 
 		if !readSuccessful {
-			log.Printf("Échec du téléchargement pour '%s': aucune copie du chunk %d n'est disponible. Dernière erreur: %v", filename, chunk.ChunkIdx, lastError)
+			log.Printf("Échec du téléchargement pour '%s': aucune copie valide du chunk %d n'est disponible. Dernière erreur: %v", filename, chunk.ChunkIdx, lastError)
 			http.Error(w, fmt.Sprintf("Fichier corrompu ou indisponible, impossible de lire le chunk %d", chunk.ChunkIdx), http.StatusServiceUnavailable)
 			return
 		}
 	}
 }
 
-// CORRIGÉ: Handler pour lancer la réparation avec une meilleure gestion des verrous
 func repairHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Lancement de la procédure de réparation en arrière-plan...")
 	go runRepairProcess()
-	// Redirige immédiatement l'utilisateur, la réparation se fait en tâche de fond.
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// CORRIGÉ: La logique de réparation est extraite dans sa propre fonction
 func runRepairProcess() {
-	// Étape 1: Identifier les chunks à réparer avec un verrou en lecture
 	type repairJob struct {
-		filename     string
-		chunkIdx     int
-		sourceCopy   *ChunkCopy
-		sourceVolume *Volume
+		filename      string
+		chunkIdx      int
+		chunkChecksum string
+		sourceCopy    *ChunkCopy
+		sourceVolume  *Volume
 	}
 	var jobs []repairJob
 
@@ -478,19 +500,16 @@ func runRepairProcess() {
 	for filename, meta := range state.FileIndex {
 		for _, chunk := range meta.Chunks {
 			var onlineCopies []*ChunkCopy
-			var excludeDiskIDs []string
 			for _, copyInfo := range chunk.Copies {
 				if vol, ok := state.RegisteredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
 					onlineCopies = append(onlineCopies, copyInfo)
-					excludeDiskIDs = append(excludeDiskIDs, vol.DiskID)
 				}
 			}
 
-			// Si le chunk est dégradé (réparable) et qu'il y a un disque de destination possible
 			if len(onlineCopies) > 0 && len(onlineCopies) < requiredReplicas {
 				sourceCopy := onlineCopies[0]
 				sourceVolume := state.RegisteredVolumes[sourceCopy.VolumeName]
-				jobs = append(jobs, repairJob{filename, chunk.ChunkIdx, sourceCopy, sourceVolume})
+				jobs = append(jobs, repairJob{filename, chunk.ChunkIdx, chunk.Checksum, sourceCopy, sourceVolume})
 			}
 		}
 	}
@@ -504,31 +523,38 @@ func runRepairProcess() {
 	log.Printf("Début de la réparation pour %d chunks...", len(jobs))
 	repairedChunks := 0
 
-	// Étape 2: Exécuter les jobs SANS verrou global
 	for _, job := range jobs {
-		// Sélectionner une destination. On le fait ici pour avoir l'état le plus récent des disques.
 		excludeDiskIDs := []string{}
 		state.RLock()
-		for _, c := range state.FileIndex[job.filename].Chunks[job.chunkIdx].Copies {
-			if v, ok := state.RegisteredVolumes[c.VolumeName]; ok {
-				excludeDiskIDs = append(excludeDiskIDs, v.DiskID)
+		if meta, ok := state.FileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
+			// ############# DEBUT DE LA CORRECTION #############
+			for _, c := range meta.Chunks[job.chunkIdx].Copies {
+				// On exclut uniquement les disques des volumes qui sont EN LIGNE
+				if v, ok := state.RegisteredVolumes[c.VolumeName]; ok && v.Status == "En ligne" {
+					excludeDiskIDs = append(excludeDiskIDs, v.DiskID)
+				}
 			}
+			// ############# FIN DE LA CORRECTION #############
+		} else {
+			state.RUnlock()
+			continue
 		}
 		targetVolumes, err := selectVolumesForReplication(1, excludeDiskIDs)
 		state.RUnlock()
-		
+
 		if err != nil {
 			log.Printf("ERREUR REPARATION: Impossible de trouver un volume de destination pour chunk %d de '%s': %v", job.chunkIdx, job.filename, err)
 			continue
 		}
 		targetVolume := targetVolumes[0]
 
-		// Lire le chunk source
 		readURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", job.sourceVolume.Address, job.sourceCopy.Offset, job.sourceCopy.Size)
 		resp, err := http.Get(readURL)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			log.Printf("ERREUR REPARATION: Impossible de lire le chunk source depuis '%s': %v", job.sourceVolume.Name, err)
-			if resp != nil { resp.Body.Close() }
+			if resp != nil {
+				resp.Body.Close()
+			}
 			continue
 		}
 		chunkData, err := io.ReadAll(resp.Body)
@@ -538,14 +564,24 @@ func runRepairProcess() {
 			continue
 		}
 
-		// Écrire le chunk sur la destination
+		hash := sha256.Sum256(chunkData)
+		actualChecksum := hex.EncodeToString(hash[:])
+		if actualChecksum != job.chunkChecksum {
+			log.Printf("!!! CORRUPTION DETECTEE PENDANT REPARATION !!! La source du chunk %d ('%s' sur '%s') est corrompue. Annulation de la copie.",
+				job.chunkIdx, job.filename, job.sourceVolume.Name)
+			continue
+		}
+
 		writeURL := fmt.Sprintf("http://%s/write_chunk", targetVolume.Address)
 		req, _ := http.NewRequest("POST", writeURL, bytes.NewReader(chunkData))
 		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("X-Chunk-Checksum", job.chunkChecksum)
 		writeResp, err := http.DefaultClient.Do(req)
 		if err != nil || writeResp.StatusCode != http.StatusOK {
 			log.Printf("ERREUR REPARATION: Impossible d'écrire le chunk sur la destination '%s': %v", targetVolume.Name, err)
-			if writeResp != nil { writeResp.Body.Close() }
+			if writeResp != nil {
+				writeResp.Body.Close()
+			}
 			continue
 		}
 
@@ -560,14 +596,12 @@ func runRepairProcess() {
 		}
 		writeResp.Body.Close()
 
-		// Étape 3: Mettre à jour les métadonnées avec un verrou en écriture court
 		state.Lock()
 		newCopy := &ChunkCopy{
 			VolumeName: targetVolume.Name,
 			Offset:     writeRespBody.Offset,
 			Size:       writeRespBody.Size,
 		}
-		// S'assurer que le fichier et le chunk existent toujours (au cas où il a été supprimé)
 		if meta, ok := state.FileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
 			meta.Chunks[job.chunkIdx].Copies = append(meta.Chunks[job.chunkIdx].Copies, newCopy)
 			repairedChunks++
@@ -589,7 +623,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	state.RLock()
 	defer state.RUnlock()
 
-	// Préparation des données pour le template
 	volumes := make([]*Volume, 0, len(state.RegisteredVolumes))
 	onlinePhysicalDisks := make(map[string]bool)
 	for _, v := range state.RegisteredVolumes {
@@ -604,7 +637,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	isRepairPossible := false
 
 	for _, f := range state.FileIndex {
-		// Calculer l'état de santé du fichier
 		isUnavailable := false
 		isDegraded := false
 		for _, chunk := range f.Chunks {
@@ -622,7 +654,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if onlineCopies < requiredReplicas {
 				isDegraded = true
-				// CORRIGÉ: La réparation est possible s'il y a un disque en ligne qui N'A PAS déjà une copie de ce chunk
 				if len(onlinePhysicalDisks) > len(onlineCopyDisks) {
 					isRepairPossible = true
 				}
@@ -642,7 +673,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 
 	notEnoughDisksForRedundancy := len(onlinePhysicalDisks) < requiredReplicas
 
-	// Tri pour un affichage stable
 	sort.Slice(volumes, func(i, j int) bool {
 		if volumes[i].DiskID == volumes[j].DiskID {
 			return volumes[i].Name < volumes[j].Name
@@ -657,14 +687,14 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 		FilesInDegradedState        bool
 		NotEnoughDisksForRedundancy bool
 		RequiredReplicas            int
-		CanRepair                   bool // La variable est conservée, sa logique de remplissage est juste améliorée
+		CanRepair                   bool
 	}{
 		Volumes:                     volumes,
 		Files:                       files,
 		FilesInDegradedState:        filesInDegradedState,
 		NotEnoughDisksForRedundancy: notEnoughDisksForRedundancy,
 		RequiredReplicas:            requiredReplicas,
-		CanRepair:                   isRepairPossible, // Utilise la nouvelle logique plus fine
+		CanRepair:                   isRepairPossible,
 	}
 
 	err := webTemplate.Execute(w, data)
