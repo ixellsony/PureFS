@@ -73,11 +73,14 @@ func (v *Volume) FreeSpaceGB() float64 {
 	return float64(v.FreeSpace) / (1024 * 1024 * 1024)
 }
 
-type GlobalState struct {
-	sync.RWMutex
-	FileIndex         map[string]*FileMetadata
-	RegisteredVolumes map[string]*Volume
-}
+// --- État Global (MODIFIÉ : Remplacement du verrou global par des verrous granulaires) ---
+var (
+	fileIndex      = make(map[string]*FileMetadata)
+	fileIndexMutex = sync.RWMutex{}
+
+	registeredVolumes = make(map[string]*Volume)
+	volumeMutex       = sync.RWMutex{}
+)
 
 // Structure pour le journal du Garbage Collection
 type GCJournal struct {
@@ -85,10 +88,6 @@ type GCJournal struct {
 	VolumeOffsetMaps map[string]map[uint64]uint64
 }
 
-var state = GlobalState{
-	FileIndex:         make(map[string]*FileMetadata),
-	RegisteredVolumes: make(map[string]*Volume),
-}
 var webTemplate *template.Template
 
 // --- Fonctions Principales ---
@@ -120,7 +119,7 @@ func main() {
 	r.HandleFunc("/api/files/download/{filename}", downloadFileHandler).Methods("GET")
 	r.HandleFunc("/api/files/delete/{filename}", deleteFileHandler).Methods("POST")
 	r.HandleFunc("/api/repair", repairHandler).Methods("POST")
-	r.HandleFunc("/api/cleanup_replicas", cleanupReplicasHandler).Methods("POST") // NOUVELLE ROUTE
+	r.HandleFunc("/api/cleanup_replicas", cleanupReplicasHandler).Methods("POST")
 	r.HandleFunc("/api/gc", garbageCollectionHandler).Methods("POST")
 	r.HandleFunc("/", webUIHandler).Methods("GET")
 
@@ -132,8 +131,9 @@ func main() {
 
 // --- Logique Métier ---
 func loadIndex() {
-	state.Lock()
-	defer state.Unlock()
+	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock()
+
 	file, err := os.Open(indexFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -144,21 +144,21 @@ func loadIndex() {
 	}
 	defer file.Close()
 	decoder := gob.NewDecoder(file)
-	if err := decoder.Decode(&state.FileIndex); err != nil {
+	if err := decoder.Decode(&fileIndex); err != nil {
 		log.Printf("Erreur au décodage de l'index: %v. L'index sera réinitialisé.", err)
-		state.FileIndex = make(map[string]*FileMetadata)
+		fileIndex = make(map[string]*FileMetadata)
 	} else {
-		log.Printf("Index chargé. %d fichiers indexés.", len(state.FileIndex))
+		log.Printf("Index chargé. %d fichiers indexés.", len(fileIndex))
 	}
 }
 
 func saveIndex() {
-	state.RLock()
-	indexCopy := make(map[string]*FileMetadata)
-	for k, v := range state.FileIndex {
+	fileIndexMutex.RLock()
+	indexCopy := make(map[string]*FileMetadata, len(fileIndex))
+	for k, v := range fileIndex {
 		indexCopy[k] = v
 	}
-	state.RUnlock()
+	fileIndexMutex.RUnlock()
 
 	tempPath := indexFilePath + ".tmp"
 	file, err := os.Create(tempPath)
@@ -191,7 +191,6 @@ func replayGCJournalIfExists() {
 	file, err := os.Open(gcJournalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Le journal n'existe pas, c'est le cas normal.
 			return
 		}
 		log.Fatalf("ERREUR CRITIQUE: Impossible d'ouvrir le journal de GC existant: %v", err)
@@ -207,14 +206,11 @@ func replayGCJournalIfExists() {
 	}
 	file.Close()
 
-	// Appliquer les changements du journal à l'index en mémoire
 	applyOffsetMaps(&journalData)
 
-	// Sauvegarder l'index maintenant corrigé
 	log.Println("Sauvegarde de l'index récupéré...")
 	saveIndex()
 
-	// Supprimer le journal puisque la récupération est terminée
 	if err := os.Remove(gcJournalPath); err != nil {
 		log.Printf("ERREUR CRITIQUE: Impossible de supprimer le journal de GC après récupération: %v. Veuillez le supprimer manuellement.", err)
 	} else {
@@ -224,8 +220,8 @@ func replayGCJournalIfExists() {
 
 // Fonction pour appliquer les maps d'offset (factorisée pour être utilisée par le GC et la récupération)
 func applyOffsetMaps(journalData *GCJournal) {
-	state.Lock()
-	defer state.Unlock()
+	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock()
 
 	log.Println("Application des mises à jour d'offset depuis le journal de GC...")
 	for volumeName, offsetMap := range journalData.VolumeOffsetMaps {
@@ -233,7 +229,7 @@ func applyOffsetMaps(journalData *GCJournal) {
 			continue
 		}
 		log.Printf("Mise à jour des offsets pour le volume '%s'...", volumeName)
-		for _, fileMeta := range state.FileIndex {
+		for _, fileMeta := range fileIndex {
 			if fileMeta.Deleted {
 				continue
 			}
@@ -265,23 +261,23 @@ func verifyVolumeOnline(volume *Volume) bool {
 	resp, err := client.Get(testURL)
 	if err != nil {
 		log.Printf("SÉCURITÉ: Volume '%s' déclaré en ligne mais inaccessible: %v", volume.Name, err)
-		state.Lock()
-		if vol, exists := state.RegisteredVolumes[volume.Name]; exists {
+		volumeMutex.Lock()
+		if vol, exists := registeredVolumes[volume.Name]; exists {
 			vol.Status = "Hors ligne"
 			log.Printf("SÉCURITÉ: Volume '%s' marqué automatiquement hors ligne", volume.Name)
 		}
-		state.Unlock()
+		volumeMutex.Unlock()
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("SÉCURITÉ: Volume '%s' répond avec un statut non-OK: %d", volume.Name, resp.StatusCode)
-		state.Lock()
-		if vol, exists := state.RegisteredVolumes[volume.Name]; exists {
+		volumeMutex.Lock()
+		if vol, exists := registeredVolumes[volume.Name]; exists {
 			vol.Status = "Hors ligne"
 		}
-		state.Unlock()
+		volumeMutex.Unlock()
 		return false
 	}
 
@@ -289,14 +285,14 @@ func verifyVolumeOnline(volume *Volume) bool {
 }
 
 func selectVolumesForReplication(count int, excludeDisks []string, requiredSpace uint64) ([]*Volume, error) {
-	state.RLock()
+	volumeMutex.RLock()
 	var candidateVolumes []*Volume
-	for _, v := range state.RegisteredVolumes {
+	for _, v := range registeredVolumes {
 		if v.Status == "En ligne" && v.FreeSpace >= requiredSpace {
 			candidateVolumes = append(candidateVolumes, v)
 		}
 	}
-	state.RUnlock()
+	volumeMutex.RUnlock()
 
 	var eligibleVolumes []*Volume
 	for _, v := range candidateVolumes {
@@ -348,7 +344,6 @@ func selectVolumesForReplication(count int, excludeDisks []string, requiredSpace
 	return result, nil
 }
 
-// MODIFIÉ: Ajout de la détection de sur-réplication
 func calculateFileStatus(meta *FileMetadata) string {
 	if meta.Deleted {
 		return "Supprimé"
@@ -356,10 +351,10 @@ func calculateFileStatus(meta *FileMetadata) string {
 
 	allChunksProtected := true
 	hasUnavailableChunk := false
-	hasOverReplicatedChunk := false // Flag pour la sur-réplication
+	hasOverReplicatedChunk := false
 
-	state.RLock()
-	defer state.RUnlock()
+	volumeMutex.RLock()
+	defer volumeMutex.RUnlock()
 
 	for _, chunk := range meta.Chunks {
 		onlineCopies := 0
@@ -370,19 +365,19 @@ func calculateFileStatus(meta *FileMetadata) string {
 				continue
 			}
 
-			if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
+			if vol, exists := registeredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
 				onlineCopies++
 				uniqueDisks[vol.DiskID] = true
 			}
 		}
-		
+
 		if onlineCopies > requiredReplicas {
 			hasOverReplicatedChunk = true
 		}
 
 		if onlineCopies == 0 {
 			hasUnavailableChunk = true
-			break 
+			break
 		}
 
 		if onlineCopies < requiredReplicas || len(uniqueDisks) < requiredReplicas {
@@ -397,7 +392,7 @@ func calculateFileStatus(meta *FileMetadata) string {
 	if !allChunksProtected {
 		return "Dégradé"
 	}
-	
+
 	if hasOverReplicatedChunk {
 		return "Sur-protégé"
 	}
@@ -421,28 +416,28 @@ func verifyChunkExistsOnVolume(volume *Volume, copyInfo *ChunkCopy, expectedChec
 }
 
 func validateUploadedFile(fileName string) error {
-	state.RLock()
-	meta, exists := state.FileIndex[fileName]
+	fileIndexMutex.RLock()
+	meta, exists := fileIndex[fileName]
 	if !exists {
-		state.RUnlock()
+		fileIndexMutex.RUnlock()
 		return fmt.Errorf("fichier '%s' non trouvé dans l'index", fileName)
 	}
 
 	chunks := make([]*ChunkMetadata, len(meta.Chunks))
 	copy(chunks, meta.Chunks)
-	state.RUnlock()
+	fileIndexMutex.RUnlock()
 
 	for i, chunk := range chunks {
 		onlineCopies := 0
 		uniqueDisks := make(map[string]bool)
 
-		state.RLock()
+		volumeMutex.RLock()
 		for _, copyInfo := range chunk.Copies {
 			if copyInfo.Deleted {
 				continue
 			}
 
-			if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
+			if vol, exists := registeredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
 				if verifyChunkExistsOnVolume(vol, copyInfo, chunk.Checksum) {
 					onlineCopies++
 					uniqueDisks[vol.DiskID] = true
@@ -452,7 +447,7 @@ func validateUploadedFile(fileName string) error {
 				}
 			}
 		}
-		state.RUnlock()
+		volumeMutex.RUnlock()
 
 		if onlineCopies < requiredReplicas || len(uniqueDisks) < requiredReplicas {
 			return fmt.Errorf("chunk %d du fichier '%s' n'a que %d copies sur %d disques différents (requis: %d)",
@@ -466,9 +461,9 @@ func validateUploadedFile(fileName string) error {
 func auditDataIntegrity() {
 	log.Println("Début de l'audit d'intégrité des données...")
 
-	state.RLock()
+	fileIndexMutex.RLock()
 	filesToAudit := make(map[string]*FileMetadata)
-	for filename, meta := range state.FileIndex {
+	for filename, meta := range fileIndex {
 		if !meta.Deleted {
 			chunks := make([]*ChunkMetadata, len(meta.Chunks))
 			copy(chunks, meta.Chunks)
@@ -480,7 +475,7 @@ func auditDataIntegrity() {
 			}
 		}
 	}
-	state.RUnlock()
+	fileIndexMutex.RUnlock()
 
 	issuesFound := 0
 	for filename, meta := range filesToAudit {
@@ -490,11 +485,11 @@ func auditDataIntegrity() {
 			log.Printf("AUDIT: Fichier '%s' a un statut problématique: %s", filename, realStatus)
 			issuesFound++
 
-			state.Lock()
-			if indexMeta, exists := state.FileIndex[filename]; exists {
+			fileIndexMutex.Lock()
+			if indexMeta, exists := fileIndex[filename]; exists {
 				indexMeta.Status = realStatus
 			}
-			state.Unlock()
+			fileIndexMutex.Unlock()
 		}
 	}
 
@@ -510,14 +505,14 @@ func cleanupInactiveVolumes() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		state.Lock()
-		for _, volume := range state.RegisteredVolumes {
+		volumeMutex.Lock()
+		for _, volume := range registeredVolumes {
 			if time.Since(volume.LastSeen) > 45*time.Second && volume.Status == "En ligne" {
 				log.Printf("Volume '%s' inactif. Marquage comme Hors ligne.", volume.Name)
 				volume.Status = "Hors ligne"
 			}
 		}
-		state.Unlock()
+		volumeMutex.Unlock()
 	}
 }
 
@@ -563,33 +558,33 @@ func runGarbageCollection() {
 
 	// Étape 1: Nettoyer les fichiers marqués comme supprimés de l'index
 	deletedCount := 0
-	state.Lock()
+	fileIndexMutex.Lock()
 	filesToDelete := make([]string, 0)
-	for filename, meta := range state.FileIndex {
+	for filename, meta := range fileIndex {
 		if meta.Deleted {
 			filesToDelete = append(filesToDelete, filename)
 		}
 	}
 
 	for _, filename := range filesToDelete {
-		delete(state.FileIndex, filename)
+		delete(fileIndex, filename)
 		deletedCount++
 	}
-	state.Unlock()
+	fileIndexMutex.Unlock()
 
 	if deletedCount > 0 {
 		log.Printf("Garbage collection: %d fichiers supprimés de l'index", deletedCount)
 	}
 
 	// Étape 2: Envoyer les commandes de compactage aux volumes
-	state.RLock()
+	volumeMutex.RLock()
 	var onlineVolumes []*Volume
-	for _, v := range state.RegisteredVolumes {
+	for _, v := range registeredVolumes {
 		if v.Status == "En ligne" {
 			onlineVolumes = append(onlineVolumes, v)
 		}
 	}
-	state.RUnlock()
+	volumeMutex.RUnlock()
 
 	var wg sync.WaitGroup
 	// Channel pour collecter les maps d'offsets des volumes
@@ -603,7 +598,6 @@ func runGarbageCollection() {
 		go func(volume *Volume) {
 			defer wg.Done()
 			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
-			// Le compactage peut prendre du temps, on augmente le timeout
 			client := &http.Client{Timeout: 15 * time.Minute}
 			resp, err := client.Post(compactURL, "application/json", nil)
 			if err != nil {
@@ -623,7 +617,6 @@ func runGarbageCollection() {
 				}
 
 				if compactResp.OffsetMap != nil && len(compactResp.OffsetMap) > 0 {
-					// Convertir la map de string en map[uint64]uint64
 					newOffsetMap := make(map[uint64]uint64)
 					for oldOffStr, newOff := range compactResp.OffsetMap {
 						oldOff, err := strconv.ParseUint(oldOffStr, 10, 64)
@@ -677,7 +670,6 @@ func runGarbageCollection() {
 		log.Printf("ERREUR CRITIQUE: Impossible d'écrire dans le journal de GC: %v. Abandon.", err)
 		return
 	}
-	// On s'assure que le journal est bien écrit sur le disque physique
 	if err := journalFile.Sync(); err != nil {
 		journalFile.Close()
 		os.Remove(gcJournalPath)
@@ -688,11 +680,9 @@ func runGarbageCollection() {
 	log.Println("Journal de transaction du GC écrit avec succès.")
 
 	// Étape 5: Appliquer les changements à l'index en mémoire
-	// (Le serveur crashe ici. Au redémarrage, replayGCJournalIfExists() corrigera l'état)
 	applyOffsetMaps(&journalData)
 
 	// Étape 6: Sauvegarder l'index principal mis à jour
-	// (Le serveur crashe ici. Au redémarrage, replayGCJournalIfExists() chargera l'ancien index, le corrigera et le sauvegardera)
 	saveIndex()
 
 	// Étape 7: Supprimer le journal, l'opération est terminée
@@ -716,10 +706,10 @@ func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state.Lock()
-	defer state.Unlock()
+	volumeMutex.Lock()
+	defer volumeMutex.Unlock()
 
-	existingVol, exists := state.RegisteredVolumes[volData.Name]
+	existingVol, exists := registeredVolumes[volData.Name]
 
 	updateVolume := func(v *Volume) {
 		v.Address = volData.Address
@@ -739,7 +729,7 @@ func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 		if !exists {
 			log.Printf("Nouveau volume enregistré : %s sur disque %s", volData.Name, volData.DiskID)
 			existingVol = &Volume{Name: volData.Name}
-			state.RegisteredVolumes[volData.Name] = existingVol
+			registeredVolumes[volData.Name] = existingVol
 		} else {
 			log.Printf("Le volume '%s' (précédemment hors ligne) est de retour.", volData.Name)
 		}
@@ -752,7 +742,7 @@ func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 		if !exists {
 			log.Printf("Avertissement : Heartbeat reçu pour un volume inconnu '%s'. Enregistrement...", volData.Name)
 			existingVol = &Volume{Name: volData.Name}
-			state.RegisteredVolumes[volData.Name] = existingVol
+			registeredVolumes[volData.Name] = existingVol
 		}
 		updateVolume(existingVol)
 		w.WriteHeader(http.StatusOK)
@@ -779,9 +769,9 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Début de l'upload pour: %s", fileName)
 
-	state.RLock()
-	_, exists := state.FileIndex[fileName]
-	state.RUnlock()
+	fileIndexMutex.RLock()
+	_, exists := fileIndex[fileName]
+	fileIndexMutex.RUnlock()
 	if exists {
 		http.Error(w, "Un fichier avec ce nom existe déjà.", http.StatusConflict)
 		return
@@ -851,11 +841,11 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 				resp, err := client.Do(req)
 				if err != nil {
 					log.Printf("ERREUR: Volume '%s' inaccessible, marquage hors ligne", v.Name)
-					state.Lock()
-					if vol, exists := state.RegisteredVolumes[v.Name]; exists {
+					volumeMutex.Lock()
+					if vol, exists := registeredVolumes[v.Name]; exists {
 						vol.Status = "Hors ligne"
 					}
-					state.Unlock()
+					volumeMutex.Unlock()
 					errs <- fmt.Errorf("volume '%s' injoignable: %w", v.Name, err)
 					return
 				}
@@ -905,13 +895,13 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		uniqueDisks := make(map[string]bool)
-		state.RLock()
+		volumeMutex.RLock()
 		for _, copy := range successfulCopies {
-			if vol, exists := state.RegisteredVolumes[copy.VolumeName]; exists {
+			if vol, exists := registeredVolumes[copy.VolumeName]; exists {
 				uniqueDisks[vol.DiskID] = true
 			}
 		}
-		state.RUnlock()
+		volumeMutex.RUnlock()
 
 		if len(uniqueDisks) < requiredReplicas {
 			uploadValid = false
@@ -949,16 +939,16 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		Chunks:     fileChunks,
 	}
 
-	state.Lock()
-	state.FileIndex[fileName] = tempMeta
-	state.Unlock()
+	fileIndexMutex.Lock()
+	fileIndex[fileName] = tempMeta
+	fileIndexMutex.Unlock()
 
 	if err := validateUploadedFile(fileName); err != nil {
 		log.Printf("ERREUR VALIDATION: Upload de '%s' échoue à la validation: %v", fileName, err)
 
-		state.Lock()
-		delete(state.FileIndex, fileName)
-		state.Unlock()
+		fileIndexMutex.Lock()
+		delete(fileIndex, fileName)
+		fileIndexMutex.Unlock()
 
 		go cleanupUploadChunks(successfulChunks)
 		http.Error(w, "Échec de la validation: "+err.Error(), http.StatusInternalServerError)
@@ -995,14 +985,14 @@ func cleanupUploadChunks(chunkIdentifiers []string) {
 		}
 	}
 
-	state.RLock()
+	volumeMutex.RLock()
 	volumes := make(map[string]*Volume)
-	for name, vol := range state.RegisteredVolumes {
+	for name, vol := range registeredVolumes {
 		if vol.Status == "En ligne" {
 			volumes[name] = vol
 		}
 	}
-	state.RUnlock()
+	volumeMutex.RUnlock()
 
 	for volumeName, chunks := range volumeChunks {
 		if vol, ok := volumes[volumeName]; ok {
@@ -1024,11 +1014,11 @@ func cleanupUploadChunks(chunkIdentifiers []string) {
 			resp, err := client.Do(req)
 			if err != nil {
 				log.Printf("Erreur lors du nettoyage des chunks orphelins sur '%s': %v", volumeName, err)
-				state.Lock()
-				if volume, exists := state.RegisteredVolumes[volumeName]; exists {
+				volumeMutex.Lock()
+				if volume, exists := registeredVolumes[volumeName]; exists {
 					volume.Status = "Hors ligne"
 				}
-				state.Unlock()
+				volumeMutex.Unlock()
 			} else {
 				resp.Body.Close()
 				log.Printf("Chunks orphelins nettoyés sur le volume '%s'", volumeName)
@@ -1061,22 +1051,27 @@ func parseChunkIdentifier(identifier string) []string {
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
-	state.RLock()
-	meta, ok := state.FileIndex[filename]
+
+	fileIndexMutex.RLock()
+	meta, ok := fileIndex[filename]
 	if !ok || meta.Deleted {
-		state.RUnlock()
+		fileIndexMutex.RUnlock()
 		http.NotFound(w, r)
 		return
 	}
-	chunks := make([]*ChunkMetadata, len(meta.Chunks))
-	copy(chunks, meta.Chunks)
-	state.RUnlock()
+	// Créer une copie des métadonnées pour travailler en dehors du verrou
+	metaCopy := &FileMetadata{
+		TotalSize: meta.TotalSize,
+		Chunks:    make([]*ChunkMetadata, len(meta.Chunks)),
+	}
+	copy(metaCopy.Chunks, meta.Chunks)
+	fileIndexMutex.RUnlock()
 
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.TotalSize))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", metaCopy.TotalSize))
 
-	for _, chunk := range chunks {
+	for _, chunk := range metaCopy.Chunks {
 		var readSuccessful bool
 		var lastError error
 		expectedChecksum := chunk.Checksum
@@ -1086,9 +1081,9 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			state.RLock()
-			volume, volOK := state.RegisteredVolumes[copyInfo.VolumeName]
-			state.RUnlock()
+			volumeMutex.RLock()
+			volume, volOK := registeredVolumes[copyInfo.VolumeName]
+			volumeMutex.RUnlock()
 
 			if !volOK {
 				lastError = fmt.Errorf("volume '%s' non trouvé", copyInfo.VolumeName)
@@ -1106,11 +1101,11 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 			resp, err := client.Get(diskURL)
 			if err != nil {
 				log.Printf("SÉCURITÉ: Erreur de lecture détectée sur '%s', marquage hors ligne", volume.Name)
-				state.Lock()
-				if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists {
+				volumeMutex.Lock()
+				if vol, exists := registeredVolumes[copyInfo.VolumeName]; exists {
 					vol.Status = "Hors ligne"
 				}
-				state.Unlock()
+				volumeMutex.Unlock()
 				lastError = fmt.Errorf("erreur de connexion à '%s': %w", volume.Name, err)
 				continue
 			}
@@ -1160,22 +1155,24 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
 
-	state.RLock()
-	meta, exists := state.FileIndex[filename]
+	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock()
+
+	meta, exists := fileIndex[filename]
 	if !exists {
-		state.RUnlock()
 		http.NotFound(w, r)
 		return
 	}
 
+	meta.Deleted = true
 	var chunksToDelete []struct {
 		volumeName string
 		offset     uint64
 		size       uint32
 	}
-
 	for _, chunk := range meta.Chunks {
 		for _, copy := range chunk.Copies {
+			copy.Deleted = true
 			chunksToDelete = append(chunksToDelete, struct {
 				volumeName string
 				offset     uint64
@@ -1183,23 +1180,12 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			}{copy.VolumeName, copy.Offset, copy.Size})
 		}
 	}
-	state.RUnlock()
-
-	state.Lock()
-	if meta, exists := state.FileIndex[filename]; exists {
-		meta.Deleted = true
-		for _, chunk := range meta.Chunks {
-			for _, copy := range chunk.Copies {
-				copy.Deleted = true
-			}
-		}
-	}
-	state.Unlock()
-
-	saveIndex()
-	log.Printf("Fichier '%s' marqué pour suppression", filename)
 
 	go func() {
+		// La sauvegarde peut prendre du temps, on la fait dans une goroutine pour libérer le client
+		saveIndex()
+		log.Printf("Fichier '%s' marqué pour suppression", filename)
+
 		volumeChunks := make(map[string][]map[string]interface{})
 
 		for _, chunk := range chunksToDelete {
@@ -1209,14 +1195,14 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
-		state.RLock()
+		volumeMutex.RLock()
 		volumes := make(map[string]*Volume)
-		for name, vol := range state.RegisteredVolumes {
+		for name, vol := range registeredVolumes {
 			if vol.Status == "En ligne" {
 				volumes[name] = vol
 			}
 		}
-		state.RUnlock()
+		volumeMutex.RUnlock()
 
 		for volumeName, chunks := range volumeChunks {
 			if vol, ok := volumes[volumeName]; ok {
@@ -1256,31 +1242,30 @@ func garbageCollectionHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// NOUVEAU: Handler pour nettoyer les copies en surplus
 func cleanupReplicasHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Lancement du nettoyage des répliques excédentaires en arrière-plan...")
 	go runCleanupReplicasProcess()
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// NOUVEAU: Processus de nettoyage des copies en surplus
 func runCleanupReplicasProcess() {
 	log.Println("Début du processus de nettoyage des répliques excédentaires.")
 
 	volumeDeletionMap := make(map[string][]map[string]interface{})
 	cleanedCount := 0
 
-	state.Lock()
+	volumeMutex.Lock()
+	fileIndexMutex.Lock()
 
-	filesToProcess := make([]*FileMetadata, 0, len(state.FileIndex))
-	for _, meta := range state.FileIndex {
+	filesToProcess := make([]*FileMetadata, 0, len(fileIndex))
+	for _, meta := range fileIndex {
 		if !meta.Deleted {
 			filesToProcess = append(filesToProcess, meta)
 		}
 	}
 
 	onlineVolumes := make(map[string]*Volume)
-	for name, vol := range state.RegisteredVolumes {
+	for name, vol := range registeredVolumes {
 		if vol.Status == "En ligne" {
 			onlineVolumes[name] = vol
 		}
@@ -1288,7 +1273,6 @@ func runCleanupReplicasProcess() {
 
 	for _, meta := range filesToProcess {
 		for chunkIdx, chunk := range meta.Chunks {
-
 			var onlineCopies []*ChunkCopy
 			for _, copyInfo := range chunk.Copies {
 				if !copyInfo.Deleted {
@@ -1299,17 +1283,14 @@ func runCleanupReplicasProcess() {
 			}
 
 			extrasToRemove := len(onlineCopies) - requiredReplicas
-
 			if extrasToRemove > 0 {
 				rand.Shuffle(len(onlineCopies), func(i, j int) {
 					onlineCopies[i], onlineCopies[j] = onlineCopies[j], onlineCopies[i]
 				})
 
 				copiesToDelete := onlineCopies[:extrasToRemove]
-
 				for _, copyToDelete := range copiesToDelete {
 					copyToDelete.Deleted = true
-
 					volumeDeletionMap[copyToDelete.VolumeName] = append(volumeDeletionMap[copyToDelete.VolumeName], map[string]interface{}{
 						"offset": copyToDelete.Offset,
 						"size":   copyToDelete.Size,
@@ -1321,14 +1302,20 @@ func runCleanupReplicasProcess() {
 		}
 	}
 
-	state.Unlock()
+	fileIndexMutex.Unlock()
+	volumeMutex.Unlock()
 
 	if cleanedCount > 0 {
 		saveIndex()
 
 		go func() {
 			for volumeName, chunks := range volumeDeletionMap {
-				if vol, ok := onlineVolumes[volumeName]; ok {
+				// Re-vérifier l'état en ligne au moment de l'envoi
+				volumeMutex.RLock()
+				vol, ok := registeredVolumes[volumeName]
+				volumeMutex.RUnlock()
+
+				if ok && vol.Status == "En ligne" {
 					deleteURL := fmt.Sprintf("http://%s/mark_deleted", vol.Address)
 					deleteData := map[string]interface{}{"chunks": chunks}
 
@@ -1353,7 +1340,6 @@ func runCleanupReplicasProcess() {
 	}
 }
 
-
 func runRepairProcess() {
 	type repairJob struct {
 		filename      string
@@ -1364,8 +1350,9 @@ func runRepairProcess() {
 	}
 	var jobs []repairJob
 
-	state.RLock()
-	for filename, meta := range state.FileIndex {
+	volumeMutex.RLock()
+	fileIndexMutex.RLock()
+	for filename, meta := range fileIndex {
 		if meta.Deleted {
 			continue
 		}
@@ -1373,7 +1360,7 @@ func runRepairProcess() {
 			var onlineCopies []*ChunkCopy
 			for _, copyInfo := range chunk.Copies {
 				if !copyInfo.Deleted {
-					if vol, ok := state.RegisteredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
+					if vol, ok := registeredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
 						onlineCopies = append(onlineCopies, copyInfo)
 					}
 				}
@@ -1381,12 +1368,13 @@ func runRepairProcess() {
 
 			if len(onlineCopies) > 0 && len(onlineCopies) < requiredReplicas {
 				sourceCopy := onlineCopies[0]
-				sourceVolume := state.RegisteredVolumes[sourceCopy.VolumeName]
+				sourceVolume := registeredVolumes[sourceCopy.VolumeName]
 				jobs = append(jobs, repairJob{filename, chunk.ChunkIdx, chunk.Checksum, sourceCopy, sourceVolume})
 			}
 		}
 	}
-	state.RUnlock()
+	fileIndexMutex.RUnlock()
+	volumeMutex.RUnlock()
 
 	if len(jobs) == 0 {
 		log.Println("Procédure de réparation terminée. Aucun chunk dégradé et réparable n'a été trouvé.")
@@ -1398,23 +1386,26 @@ func runRepairProcess() {
 
 	for _, job := range jobs {
 		excludeDiskIDs := []string{}
-		state.RLock()
-		if meta, ok := state.FileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
+		volumeMutex.RLock()
+		fileIndexMutex.RLock()
+		if meta, ok := fileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
 			for _, c := range meta.Chunks[job.chunkIdx].Copies {
 				if !c.Deleted {
-					if v, ok := state.RegisteredVolumes[c.VolumeName]; ok && v.Status == "En ligne" {
+					if v, ok := registeredVolumes[c.VolumeName]; ok && v.Status == "En ligne" {
 						excludeDiskIDs = append(excludeDiskIDs, v.DiskID)
 					}
 				}
 			}
 		} else {
-			state.RUnlock()
+			fileIndexMutex.RUnlock()
+			volumeMutex.RUnlock()
 			continue
 		}
+		fileIndexMutex.RUnlock()
+		volumeMutex.RUnlock()
 
 		requiredSpace := uint64(job.sourceCopy.Size) + minFreeSpaceForUpload
 		targetVolumes, err := selectVolumesForReplication(1, excludeDiskIDs, requiredSpace)
-		state.RUnlock()
 
 		if err != nil {
 			log.Printf("ERREUR REPARATION: Impossible de trouver un volume de destination pour chunk %d de '%s': %v", job.chunkIdx, job.filename, err)
@@ -1470,19 +1461,19 @@ func runRepairProcess() {
 		}
 		writeResp.Body.Close()
 
-		state.Lock()
+		fileIndexMutex.Lock()
 		newCopy := &ChunkCopy{
 			VolumeName: targetVolume.Name,
 			Offset:     writeRespBody.Offset,
 			Size:       writeRespBody.Size,
 		}
-		if meta, ok := state.FileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
+		if meta, ok := fileIndex[job.filename]; ok && job.chunkIdx < len(meta.Chunks) {
 			meta.Chunks[job.chunkIdx].Copies = append(meta.Chunks[job.chunkIdx].Copies, newCopy)
 			repairedChunks++
 			log.Printf("Succès: Chunk %d de '%s' recopié de '%s' vers '%s' (Disque: %s)",
 				job.chunkIdx, job.filename, job.sourceVolume.Name, targetVolume.Name, targetVolume.DiskID)
 		}
-		state.Unlock()
+		fileIndexMutex.Unlock()
 	}
 
 	if repairedChunks > 0 {
@@ -1493,32 +1484,35 @@ func runRepairProcess() {
 	}
 }
 
-// MODIFIÉ: Ajout de la variable HasOverReplicatedFiles
 func webUIHandler(w http.ResponseWriter, r *http.Request) {
-	state.RLock()
-	defer state.RUnlock()
+	// Verrouiller les mutex dans un ordre constant pour éviter les deadlocks
+	volumeMutex.RLock()
+	fileIndexMutex.RLock()
+	defer fileIndexMutex.RUnlock()
+	defer volumeMutex.RUnlock()
 
-	volumes := make([]*Volume, 0, len(state.RegisteredVolumes))
+	volumes := make([]*Volume, 0, len(registeredVolumes))
 	onlinePhysicalDisks := make(map[string]bool)
-	for _, v := range state.RegisteredVolumes {
+	for _, v := range registeredVolumes {
 		volumes = append(volumes, v)
 		if v.Status == "En ligne" {
 			onlinePhysicalDisks[v.DiskID] = true
 		}
 	}
 
-	files := make([]*FileMetadata, 0, len(state.FileIndex))
+	files := make([]*FileMetadata, 0, len(fileIndex))
 	filesInDegradedState := false
-	hasOverReplicatedFiles := false // Flag pour les fichiers sur-protégés
+	hasOverReplicatedFiles := false
 	isRepairPossible := false
 	deletedFilesCount := 0
 
-	for _, f := range state.FileIndex {
+	for _, f := range fileIndex {
 		if f.Deleted {
 			deletedFilesCount++
 			continue
 		}
 
+		// calculateFileStatus a besoin de la liste des volumes, qui est déjà verrouillée en lecture.
 		f.Status = calculateFileStatus(f)
 
 		if f.Status == "Dégradé" {
@@ -1528,7 +1522,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 				onlineCopyDisks := make(map[string]bool)
 				for _, copyInfo := range chunk.Copies {
 					if !copyInfo.Deleted {
-						if vol, ok := state.RegisteredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
+						if vol, ok := registeredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
 							onlineCopyDisks[vol.DiskID] = true
 						}
 					}
@@ -1561,7 +1555,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 		Volumes                     []*Volume
 		Files                       []*FileMetadata
 		FilesInDegradedState        bool
-		HasOverReplicatedFiles      bool // Variable pour le template
+		HasOverReplicatedFiles      bool
 		NotEnoughDisksForRedundancy bool
 		RequiredReplicas            int
 		CanRepair                   bool
@@ -1583,7 +1577,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// MODIFIÉ: Mise à jour du template HTML
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
