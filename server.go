@@ -73,7 +73,7 @@ func (v *Volume) FreeSpaceGB() float64 {
 	return float64(v.FreeSpace) / (1024 * 1024 * 1024)
 }
 
-// --- État Global (MODIFIÉ : Remplacement du verrou global par des verrous granulaires) ---
+// --- État Global ---
 var (
 	fileIndex      = make(map[string]*FileMetadata)
 	fileIndexMutex = sync.RWMutex{}
@@ -152,14 +152,9 @@ func loadIndex() {
 	}
 }
 
-func saveIndex() {
-	fileIndexMutex.RLock()
-	indexCopy := make(map[string]*FileMetadata, len(fileIndex))
-	for k, v := range fileIndex {
-		indexCopy[k] = v
-	}
-	fileIndexMutex.RUnlock()
-
+// saveIndex_unlocked effectue la sauvegarde physique sans gérer les verrous.
+// Le code appelant DOIT détenir le fileIndexMutex.Lock() pour garantir la cohérence.
+func saveIndex_unlocked() {
 	tempPath := indexFilePath + ".tmp"
 	file, err := os.Create(tempPath)
 	if err != nil {
@@ -168,8 +163,9 @@ func saveIndex() {
 	}
 
 	encoder := gob.NewEncoder(file)
-	err = encoder.Encode(&indexCopy)
-	file.Close()
+	// On encode directement la variable globale car on est sous verrou
+	err = encoder.Encode(&fileIndex)
+	file.Close() // Fermer avant de renommer
 
 	if err != nil {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
@@ -183,7 +179,14 @@ func saveIndex() {
 		return
 	}
 
-	log.Printf("Index sauvegardé de manière atomique avec %d fichiers", len(indexCopy))
+	log.Printf("Index sauvegardé de manière atomique avec %d fichiers", len(fileIndex))
+}
+
+// saveIndex est la fonction publique qui prend le verrou avant de sauvegarder.
+func saveIndex() {
+	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock()
+	saveIndex_unlocked()
 }
 
 // Fonction pour rejouer le journal de GC si le serveur a crashé
@@ -218,11 +221,9 @@ func replayGCJournalIfExists() {
 	}
 }
 
-// Fonction pour appliquer les maps d'offset (factorisée pour être utilisée par le GC et la récupération)
-func applyOffsetMaps(journalData *GCJournal) {
-	fileIndexMutex.Lock()
-	defer fileIndexMutex.Unlock()
-
+// applyOffsetMaps_unlocked effectue la mise à jour des offsets sans gérer les verrous.
+// Le code appelant DOIT détenir le fileIndexMutex.Lock().
+func applyOffsetMaps_unlocked(journalData *GCJournal) {
 	log.Println("Application des mises à jour d'offset depuis le journal de GC...")
 	for volumeName, offsetMap := range journalData.VolumeOffsetMaps {
 		if len(offsetMap) == 0 {
@@ -252,6 +253,14 @@ func applyOffsetMaps(journalData *GCJournal) {
 		}
 	}
 	log.Println("Application des mises à jour d'offset terminée.")
+}
+
+
+// applyOffsetMaps est la fonction publique qui prend le verrou.
+func applyOffsetMaps(journalData *GCJournal) {
+	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock()
+	applyOffsetMaps_unlocked(journalData)
 }
 
 func verifyVolumeOnline(volume *Volume) bool {
@@ -556,42 +565,76 @@ func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool)
 	return 0, false
 }
 
-// La fonction de garbage collection est maintenant transactionnelle grâce au journal
+// runGarbageCollection a été entièrement réécrite pour corriger la race condition.
+// Elle verrouille l'index des fichiers pendant toute la durée des opérations critiques
+// pour éviter que de nouveaux fichiers ne soient affectés par le nettoyage.
 func runGarbageCollection() {
 	log.Println("Lancement du garbage collection...")
 
-	// Étape 1: Nettoyer les fichiers marqués comme supprimés de l'index
-	deletedCount := 0
+	// --- DÉBUT DE LA CORRECTION DE LA RACE CONDITION ---
+	// On prend un VERROU EN ÉCRITURE sur l'index des fichiers.
+	// Ce verrou sera maintenu jusqu'à la fin de la fonction pour garantir qu'aucun
+	// nouvel upload ne puisse être finalisé (et donc voir ses chunks effacés par erreur)
+	// pendant que le GC est en cours.
 	fileIndexMutex.Lock()
+	defer fileIndexMutex.Unlock() // Le verrou sera relâché à la fin de la fonction.
+
+	log.Println("GC: Verrou de l'index acquis. Les uploads sont mis en pause.")
+
+	// Étape 1: Nettoyer les fichiers marqués comme supprimés de l'index (sous le verrou)
+	deletedCount := 0
 	filesToDelete := make([]string, 0)
 	for filename, meta := range fileIndex {
 		if meta.Deleted {
 			filesToDelete = append(filesToDelete, filename)
 		}
 	}
-
 	for _, filename := range filesToDelete {
 		delete(fileIndex, filename)
 		deletedCount++
 	}
-	fileIndexMutex.Unlock()
 
 	if deletedCount > 0 {
-		log.Printf("Garbage collection: %d fichiers supprimés de l'index", deletedCount)
+		log.Printf("GC: %d fichiers supprimés de l'index", deletedCount)
 	}
 
-	// Étape 2: Envoyer les commandes de compactage aux volumes
+	// Étape 2: Construire la liste des chunks à conserver pour TOUS les volumes
+	// à partir de l'état maintenant cohérent et figé de l'index.
+	type ChunkToKeep struct {
+		Offset uint64 `json:"offset"`
+		Size   uint32 `json:"size"`
+	}
+	chunksToKeepByVolume := make(map[string][]ChunkToKeep)
+
 	volumeMutex.RLock()
-	var onlineVolumes []*Volume
+	onlineVolumes := make([]*Volume, 0, len(registeredVolumes))
 	for _, v := range registeredVolumes {
 		if v.Status == "En ligne" {
 			onlineVolumes = append(onlineVolumes, v)
 		}
 	}
+
+	for _, fileMeta := range fileIndex {
+		// Pas besoin de revérifier fileMeta.Deleted, ils ont été supprimés à l'étape 1
+		for _, chunkMeta := range fileMeta.Chunks {
+			for _, copyInfo := range chunkMeta.Copies {
+				if !copyInfo.Deleted {
+					if vol, exists := registeredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
+						chunksToKeepByVolume[copyInfo.VolumeName] = append(chunksToKeepByVolume[copyInfo.VolumeName], ChunkToKeep{
+							Offset: copyInfo.Offset,
+							Size:   copyInfo.Size,
+						})
+					}
+				}
+			}
+		}
+	}
 	volumeMutex.RUnlock()
 
+	log.Println("GC: Snapshot cohérent de l'index créé. Envoi des commandes de compactage...")
+
+	// Étape 3: Envoyer les commandes de compactage aux volumes de manière concurrente
 	var wg sync.WaitGroup
-	// Channel pour collecter les maps d'offsets des volumes
 	offsetMapsChan := make(chan struct {
 		VolumeName string
 		OffsetMap  map[uint64]uint64
@@ -599,77 +642,40 @@ func runGarbageCollection() {
 
 	for _, vol := range onlineVolumes {
 		wg.Add(1)
-		go func(volume *Volume) {
+		go func(volume *Volume, chunksToKeep []ChunkToKeep) {
 			defer wg.Done()
-
-			// ### CORRECTION : Le serveur devient la source de vérité ###
-			// Construire la liste exacte des chunks que le volume doit conserver.
-			log.Printf("GC: Construction de la liste des chunks à conserver pour le volume '%s'...", volume.Name)
-
-			type ChunkToKeep struct {
-				Offset uint64 `json:"offset"`
-				Size   uint32 `json:"size"`
-			}
-			var chunksToKeep []ChunkToKeep
-
-			fileIndexMutex.RLock()
-			for _, fileMeta := range fileIndex {
-				// On ne s'intéresse qu'aux fichiers actifs
-				if fileMeta.Deleted {
-					continue
-				}
-				for _, chunkMeta := range fileMeta.Chunks {
-					for _, copyInfo := range chunkMeta.Copies {
-						// On cherche les chunks qui sont sur le volume actuel et ne sont pas supprimés
-						if copyInfo.VolumeName == volume.Name && !copyInfo.Deleted {
-							chunksToKeep = append(chunksToKeep, ChunkToKeep{
-								Offset: copyInfo.Offset,
-								Size:   copyInfo.Size,
-							})
-						}
-					}
-				}
-			}
-			fileIndexMutex.RUnlock()
-
 			log.Printf("GC: Volume '%s' doit conserver %d chunks.", volume.Name, len(chunksToKeep))
 
-			// Préparer le corps de la requête pour le volume
 			requestBody, err := json.Marshal(struct {
 				ChunksToKeep []ChunkToKeep `json:"chunks_to_keep"`
 			}{ChunksToKeep: chunksToKeep})
-
 			if err != nil {
-				log.Printf("Erreur de sérialisation des instructions de compactage pour '%s': %v", volume.Name, err)
+				log.Printf("Erreur de sérialisation pour '%s': %v", volume.Name, err)
 				return
 			}
 
 			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
-			client := &http.Client{Timeout: 15 * time.Minute} // Le compactage peut être long
+			client := &http.Client{Timeout: 15 * time.Minute}
 
-			// Envoyer la commande de compactage avec la liste précise des chunks à conserver
 			resp, err := client.Post(compactURL, "application/json", bytes.NewBuffer(requestBody))
 			if err != nil {
-				log.Printf("Erreur lors de la demande de compactage au volume '%s': %v", volume.Name, err)
+				log.Printf("Erreur lors de la demande de compactage à '%s': %v", volume.Name, err)
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode == http.StatusOK {
 				var compactResp struct {
-					Status    string            `json:"status"`
 					OffsetMap map[string]uint64 `json:"offset_map"`
 				}
 				if err := json.NewDecoder(resp.Body).Decode(&compactResp); err != nil {
-					log.Printf("Erreur de décodage de la réponse de compactage de '%s': %v", volume.Name, err)
+					log.Printf("Erreur de décodage de la réponse de '%s': %v", volume.Name, err)
 					return
 				}
-
 				if compactResp.OffsetMap != nil && len(compactResp.OffsetMap) > 0 {
 					newOffsetMap := make(map[uint64]uint64)
 					for oldOffStr, newOff := range compactResp.OffsetMap {
-						oldOff, err := strconv.ParseUint(oldOffStr, 10, 64)
-						if err == nil {
+						if oldOff, err := strconv.ParseUint(oldOffStr, 10, 64); err == nil {
 							newOffsetMap[oldOff] = newOff
 						}
 					}
@@ -678,17 +684,19 @@ func runGarbageCollection() {
 						OffsetMap  map[uint64]uint64
 					}{VolumeName: volume.Name, OffsetMap: newOffsetMap}
 				}
-				log.Printf("Compactage du volume '%s' terminé avec succès", volume.Name)
+				log.Printf("Compactage du volume '%s' terminé", volume.Name)
 			} else {
 				body, _ := io.ReadAll(resp.Body)
-				log.Printf("Erreur lors du compactage du volume '%s': status %d, body: %s", volume.Name, resp.StatusCode, string(body))
+				log.Printf("Erreur lors du compactage de '%s': status %d, body: %s", volume.Name, resp.StatusCode, string(body))
 			}
-		}(vol)
+		}(vol, chunksToKeepByVolume[vol.Name]) // On passe la liste spécifique en paramètre
 	}
 	wg.Wait()
 	close(offsetMapsChan)
 
-	// Étape 3: Collecter tous les résultats et préparer le journal
+	log.Println("GC: Tous les volumes ont terminé le compactage.")
+
+	// Étape 4: Collecter tous les résultats et préparer le journal
 	journalData := GCJournal{
 		VolumeOffsetMaps: make(map[string]map[uint64]uint64),
 	}
@@ -701,15 +709,15 @@ func runGarbageCollection() {
 	}
 
 	if !hasChanges {
-		log.Println("Garbage collection terminé. Aucun changement d'offset à appliquer.")
-		return
+		log.Println("GC terminé. Aucun changement d'offset à appliquer.")
+		return // Le defer déverrouillera fileIndexMutex
 	}
 
-	// Étape 4: Écrire les changements dans un journal AVANT de modifier l'état en mémoire
-	log.Println("Écriture du journal de transaction pour le GC...")
+	// Étape 5: Écrire les changements dans un journal AVANT de modifier l'état en mémoire
+	log.Println("GC: Écriture du journal de transaction...")
 	journalFile, err := os.Create(gcJournalPath)
 	if err != nil {
-		log.Printf("ERREUR CRITIQUE: Impossible de créer le journal de GC: %v. Abandon du GC.", err)
+		log.Printf("ERREUR CRITIQUE: Impossible de créer le journal de GC: %v. Abandon.", err)
 		return
 	}
 	encoder := gob.NewEncoder(journalFile)
@@ -719,28 +727,23 @@ func runGarbageCollection() {
 		log.Printf("ERREUR CRITIQUE: Impossible d'écrire dans le journal de GC: %v. Abandon.", err)
 		return
 	}
-	if err := journalFile.Sync(); err != nil {
-		journalFile.Close()
-		os.Remove(gcJournalPath)
-		log.Printf("ERREUR CRITIQUE: Impossible de synchroniser le journal de GC sur le disque: %v. Abandon.", err)
-		return
-	}
 	journalFile.Close()
-	log.Println("Journal de transaction du GC écrit avec succès.")
 
-	// Étape 5: Appliquer les changements à l'index en mémoire
-	applyOffsetMaps(&journalData)
+	// Étape 6: Appliquer les changements à l'index en mémoire (toujours sous verrou)
+	applyOffsetMaps_unlocked(&journalData)
 
-	// Étape 6: Sauvegarder l'index principal mis à jour
-	saveIndex()
+	// Étape 7: Sauvegarder l'index principal mis à jour (toujours sous verrou)
+	saveIndex_unlocked()
 
-	// Étape 7: Supprimer le journal, l'opération est terminée
+	// Étape 8: Supprimer le journal, l'opération est terminée
 	if err := os.Remove(gcJournalPath); err != nil {
 		log.Printf("AVERTISSEMENT: Impossible de supprimer le journal de GC après succès: %v", err)
 	}
 
-	log.Println("Garbage collection terminé et index mis à jour de manière transactionnelle.")
+	log.Println("Garbage collection terminé et index mis à jour de manière transactionnelle et sécurisée.")
+	// Le defer fileIndexMutex.Unlock() s'exécute ici, libérant les uploads en attente.
 }
+
 
 // --- Handlers HTTP ---
 
@@ -987,7 +990,7 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		UploadDate: time.Now(),
 		Chunks:     fileChunks,
 	}
-
+    // L'ajout à l'index est la section critique. Il attendra si un GC est en cours.
 	fileIndexMutex.Lock()
 	fileIndex[fileName] = tempMeta
 	fileIndexMutex.Unlock()
@@ -1229,10 +1232,11 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			}{copy.VolumeName, copy.Offset, copy.Size})
 		}
 	}
-
+	
+	// Utilisation de la version _unlocked car nous détenons déjà le verrou
+	saveIndex_unlocked()
+	
 	go func() {
-		// La sauvegarde peut prendre du temps, on la fait dans une goroutine pour libérer le client
-		saveIndex()
 		log.Printf("Fichier '%s' marqué pour suppression", filename)
 
 		volumeChunks := make(map[string][]map[string]interface{})
@@ -1350,13 +1354,16 @@ func runCleanupReplicasProcess() {
 			}
 		}
 	}
+	
+	if cleanedCount > 0 {
+		saveIndex_unlocked()
+	}
 
 	fileIndexMutex.Unlock()
 	volumeMutex.Unlock()
 
-	if cleanedCount > 0 {
-		saveIndex()
 
+	if cleanedCount > 0 {
 		go func() {
 			for volumeName, chunks := range volumeDeletionMap {
 				// Re-vérifier l'état en ligne au moment de l'envoi
