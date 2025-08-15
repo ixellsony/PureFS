@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"text/template"
 	"time"
@@ -22,9 +23,10 @@ import (
 
 // --- Constantes et Configuration ---
 const (
-	indexFilePath    = "index.idx"
-	chunkSize        = 8 * 1024 * 1024 // 8 MB
-	requiredReplicas = 2
+	indexFilePath         = "index.idx"
+	chunkSize             = 8 * 1024 * 1024     // 8 MB
+	requiredReplicas      = 2
+	minFreeSpaceForUpload = 100 * 1024 * 1024 // 100 MB minimum
 )
 
 // --- Structures de Données ---
@@ -89,6 +91,14 @@ func main() {
 	go cleanupInactiveVolumes()
 	go garbageCollectionWorker()
 
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute) // Audit toutes les 10 minutes
+		defer ticker.Stop()
+		for range ticker.C {
+			auditDataIntegrity()
+		}
+	}()
+
 	var err error
 	webTemplate, err = template.New("webui").Parse(htmlTemplate)
 	if err != nil {
@@ -139,32 +149,86 @@ func saveIndex() {
 		indexCopy[k] = v
 	}
 	state.RUnlock()
-	
-	file, err := os.Create(indexFilePath)
+
+	tempPath := indexFilePath + ".tmp"
+	file, err := os.Create(tempPath)
 	if err != nil {
-		log.Printf("ERREUR: Impossible de sauvegarder l'index: %v", err)
+		log.Printf("ERREUR: Impossible de créer le fichier temporaire pour l'index: %v", err)
 		return
 	}
-	defer file.Close()
+
 	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(&indexCopy); err != nil {
+	err = encoder.Encode(&indexCopy)
+	file.Close()
+
+	if err != nil {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
+		os.Remove(tempPath)
+		return
 	}
+
+	if err := os.Rename(tempPath, indexFilePath); err != nil {
+		log.Printf("ERREUR: Impossible de finaliser la sauvegarde de l'index: %v", err)
+		os.Remove(tempPath)
+		return
+	}
+
+	log.Printf("Index sauvegardé de manière atomique avec %d fichiers", len(indexCopy))
 }
 
-func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, error) {
-	state.RLock()
-	defer state.RUnlock()
+func verifyVolumeOnline(volume *Volume) bool {
+	if volume.Status != "En ligne" {
+		return false
+	}
 
-	var onlineVolumes []*Volume
+	client := &http.Client{Timeout: 3 * time.Second}
+	testURL := fmt.Sprintf("http://%s/health", volume.Address)
+
+	resp, err := client.Get(testURL)
+	if err != nil {
+		log.Printf("SÉCURITÉ: Volume '%s' déclaré en ligne mais inaccessible: %v", volume.Name, err)
+		state.Lock()
+		if vol, exists := state.RegisteredVolumes[volume.Name]; exists {
+			vol.Status = "Hors ligne"
+			log.Printf("SÉCURITÉ: Volume '%s' marqué automatiquement hors ligne", volume.Name)
+		}
+		state.Unlock()
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("SÉCURITÉ: Volume '%s' répond avec un statut non-OK: %d", volume.Name, resp.StatusCode)
+		state.Lock()
+		if vol, exists := state.RegisteredVolumes[volume.Name]; exists {
+			vol.Status = "Hors ligne"
+		}
+		state.Unlock()
+		return false
+	}
+
+	return true
+}
+
+func selectVolumesForReplication(count int, excludeDisks []string, requiredSpace uint64) ([]*Volume, error) {
+	state.RLock()
+	var candidateVolumes []*Volume
 	for _, v := range state.RegisteredVolumes {
-		if v.Status == "En ligne" {
-			onlineVolumes = append(onlineVolumes, v)
+		if v.Status == "En ligne" && v.FreeSpace >= requiredSpace {
+			candidateVolumes = append(candidateVolumes, v)
+		}
+	}
+	state.RUnlock()
+
+	var eligibleVolumes []*Volume
+	for _, v := range candidateVolumes {
+		if verifyVolumeOnline(v) {
+			eligibleVolumes = append(eligibleVolumes, v)
 		}
 	}
 
 	volumesByDiskID := make(map[string][]*Volume)
-	for _, v := range onlineVolumes {
+	for _, v := range eligibleVolumes {
 		isExcluded := false
 		for _, excluded := range excludeDisks {
 			if v.DiskID == excluded {
@@ -178,7 +242,8 @@ func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, e
 	}
 
 	if len(volumesByDiskID) < count {
-		return nil, fmt.Errorf("pas assez de disques physiques uniques disponibles (requis: %d, dispo: %d)", count, len(volumesByDiskID))
+		return nil, fmt.Errorf("pas assez de disques physiques VÉRIFIÉS avec l'espace libre requis (%d MB) disponibles (requis: %d, dispo: %d)",
+			requiredSpace/(1024*1024), count, len(volumesByDiskID))
 	}
 
 	var availableDiskIDs []string
@@ -193,11 +258,164 @@ func selectVolumesForReplication(count int, excludeDisks []string) ([]*Volume, e
 	var result []*Volume
 	for _, diskID := range selectedDisks {
 		volumesOnThisDisk := volumesByDiskID[diskID]
-		selectedVolume := volumesOnThisDisk[rand.Intn(len(volumesOnThisDisk))]
+		selectedVolume := volumesOnThisDisk[0]
+		for _, vol := range volumesOnThisDisk {
+			if vol.FreeSpace > selectedVolume.FreeSpace {
+				selectedVolume = vol
+			}
+		}
 		result = append(result, selectedVolume)
 	}
 
 	return result, nil
+}
+
+func calculateFileStatus(meta *FileMetadata) string {
+	if meta.Deleted {
+		return "Supprimé"
+	}
+
+	allChunksProtected := true
+	hasUnavailableChunk := false
+
+	state.RLock()
+	defer state.RUnlock()
+
+	for _, chunk := range meta.Chunks {
+		onlineCopies := 0
+		uniqueDisks := make(map[string]bool)
+
+		for _, copyInfo := range chunk.Copies {
+			if copyInfo.Deleted {
+				continue
+			}
+
+			if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
+				onlineCopies++
+				uniqueDisks[vol.DiskID] = true
+			}
+		}
+
+		if onlineCopies == 0 {
+			hasUnavailableChunk = true
+			break
+		}
+
+		if onlineCopies < requiredReplicas || len(uniqueDisks) < requiredReplicas {
+			allChunksProtected = false
+		}
+	}
+
+	if hasUnavailableChunk {
+		return "Indisponible"
+	}
+
+	if !allChunksProtected {
+		return "Dégradé"
+	}
+
+	return "Protégé"
+}
+
+func verifyChunkExistsOnVolume(volume *Volume, copyInfo *ChunkCopy, expectedChecksum string) bool {
+	client := &http.Client{Timeout: 5 * time.Second}
+	checkURL := fmt.Sprintf("http://%s/verify_chunk?offset=%d&size=%d&checksum=%s",
+		volume.Address, copyInfo.Offset, copyInfo.Size, expectedChecksum)
+
+	resp, err := client.Get(checkURL)
+	if err != nil {
+		log.Printf("ERREUR VERIFICATION: Impossible de vérifier chunk sur '%s': %v", volume.Name, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
+}
+
+func validateUploadedFile(fileName string) error {
+	state.RLock()
+	meta, exists := state.FileIndex[fileName]
+	if !exists {
+		state.RUnlock()
+		return fmt.Errorf("fichier '%s' non trouvé dans l'index", fileName)
+	}
+
+	chunks := make([]*ChunkMetadata, len(meta.Chunks))
+	copy(chunks, meta.Chunks)
+	state.RUnlock()
+
+	for i, chunk := range chunks {
+		onlineCopies := 0
+		uniqueDisks := make(map[string]bool)
+
+		state.RLock()
+		for _, copyInfo := range chunk.Copies {
+			if copyInfo.Deleted {
+				continue
+			}
+
+			if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists && vol.Status == "En ligne" {
+				if verifyChunkExistsOnVolume(vol, copyInfo, chunk.Checksum) {
+					onlineCopies++
+					uniqueDisks[vol.DiskID] = true
+				} else {
+					log.Printf("ERREUR VALIDATION: Chunk %d du fichier '%s' introuvable sur volume '%s'",
+						i, fileName, vol.Name)
+				}
+			}
+		}
+		state.RUnlock()
+
+		if onlineCopies < requiredReplicas || len(uniqueDisks) < requiredReplicas {
+			return fmt.Errorf("chunk %d du fichier '%s' n'a que %d copies sur %d disques différents (requis: %d)",
+				i, fileName, onlineCopies, len(uniqueDisks), requiredReplicas)
+		}
+	}
+
+	return nil
+}
+
+func auditDataIntegrity() {
+	log.Println("Début de l'audit d'intégrité des données...")
+
+	state.RLock()
+	filesToAudit := make(map[string]*FileMetadata)
+	for filename, meta := range state.FileIndex {
+		if !meta.Deleted {
+			chunks := make([]*ChunkMetadata, len(meta.Chunks))
+			copy(chunks, meta.Chunks)
+			filesToAudit[filename] = &FileMetadata{
+				FileName:   meta.FileName,
+				TotalSize:  meta.TotalSize,
+				UploadDate: meta.UploadDate,
+				Chunks:     chunks,
+			}
+		}
+	}
+	state.RUnlock()
+
+	issuesFound := 0
+	for filename, meta := range filesToAudit {
+		realStatus := calculateFileStatus(meta)
+
+		if realStatus == "Dégradé" || realStatus == "Indisponible" {
+			log.Printf("AUDIT: Fichier '%s' a un statut problématique: %s", filename, realStatus)
+			issuesFound++
+
+			state.Lock()
+			if indexMeta, exists := state.FileIndex[filename]; exists {
+				indexMeta.Status = realStatus
+			}
+			state.Unlock()
+		}
+	}
+
+	if issuesFound > 0 {
+		saveIndex()
+		log.Printf("AUDIT: %d problèmes d'intégrité détectés et corrigés", issuesFound)
+	} else {
+		log.Println("AUDIT: Aucun problème d'intégrité détecté")
+	}
 }
 
 func cleanupInactiveVolumes() {
@@ -216,17 +434,48 @@ func cleanupInactiveVolumes() {
 }
 
 func garbageCollectionWorker() {
-	ticker := time.NewTicker(5 * time.Minute) // Garbage collection toutes les 5 minutes
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		runGarbageCollection()
 	}
 }
 
+// CORRECTION: Nouvelle fonction pour trouver le nouvel offset après compactage
+func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool) {
+	if offsetMap == nil || len(offsetMap) == 0 {
+		return 0, false
+	}
+
+	var bestMatchOldStart uint64
+	found := false
+
+	// Trouver le début du bloc de données dans lequel notre chunk se trouvait
+	// C'est le plus grand offset de départ dans la map qui est inférieur ou égal à notre offset
+	for oldStart := range offsetMap {
+		if oldStart <= oldOffset {
+			if !found || oldStart > bestMatchOldStart {
+				bestMatchOldStart = oldStart
+				found = true
+			}
+		}
+	}
+
+	if found {
+		newStart := offsetMap[bestMatchOldStart]
+		relativeOffset := oldOffset - bestMatchOldStart
+		return newStart + relativeOffset, true
+	}
+
+	return 0, false
+}
+
+
+// CORRECTION: Fonction de garbage collection mise à jour
 func runGarbageCollection() {
-	log.Println("Début du garbage collection...")
-	
-	// Étape 1: Nettoyer les fichiers marqués comme supprimés
+	log.Println("Lancement du garbage collection...")
+
+	// Étape 1: Nettoyer les fichiers marqués comme supprimés de l'index
 	deletedCount := 0
 	state.Lock()
 	filesToDelete := make([]string, 0)
@@ -235,18 +484,17 @@ func runGarbageCollection() {
 			filesToDelete = append(filesToDelete, filename)
 		}
 	}
-	
+
 	for _, filename := range filesToDelete {
 		delete(state.FileIndex, filename)
 		deletedCount++
 	}
 	state.Unlock()
-	
+
 	if deletedCount > 0 {
-		saveIndex()
 		log.Printf("Garbage collection: %d fichiers supprimés de l'index", deletedCount)
 	}
-	
+
 	// Étape 2: Envoyer les commandes de compactage aux volumes
 	state.RLock()
 	var onlineVolumes []*Volume
@@ -259,32 +507,95 @@ func runGarbageCollection() {
 		}
 	}
 	state.RUnlock()
-	
+
 	var wg sync.WaitGroup
+	// Channel pour collecter les maps d'offsets des volumes
+	offsetMapsChan := make(chan struct {
+		VolumeName string
+		OffsetMap  map[uint64]uint64
+	}, len(onlineVolumes))
+
 	for _, vol := range onlineVolumes {
 		wg.Add(1)
 		go func(volume *Volume) {
 			defer wg.Done()
 			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
-			client := &http.Client{Timeout: 30 * time.Second}
+			// Le compactage peut prendre du temps, on augmente le timeout
+			client := &http.Client{Timeout: 5 * time.Minute}
 			resp, err := client.Post(compactURL, "application/json", nil)
 			if err != nil {
-				log.Printf("Erreur lors du compactage du volume '%s': %v", volume.Name, err)
+				log.Printf("Erreur lors de la demande de compactage au volume '%s': %v", volume.Name, err)
 				return
 			}
 			defer resp.Body.Close()
-			
+
 			if resp.StatusCode == http.StatusOK {
+				var compactResp struct {
+					Status    string            `json:"status"`
+					OffsetMap map[string]uint64 `json:"offset_map"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&compactResp); err != nil {
+					log.Printf("Erreur de décodage de la réponse de compactage de '%s': %v", volume.Name, err)
+					return
+				}
+
+				if compactResp.OffsetMap != nil {
+					// Convertir la map de string en map[uint64]uint64
+					newOffsetMap := make(map[uint64]uint64)
+					for oldOffStr, newOff := range compactResp.OffsetMap {
+						oldOff, err := strconv.ParseUint(oldOffStr, 10, 64)
+						if err == nil {
+							newOffsetMap[oldOff] = newOff
+						}
+					}
+					offsetMapsChan <- struct {
+						VolumeName string
+						OffsetMap  map[uint64]uint64
+					}{VolumeName: volume.Name, OffsetMap: newOffsetMap}
+				}
 				log.Printf("Compactage du volume '%s' terminé avec succès", volume.Name)
 			} else {
-				log.Printf("Erreur lors du compactage du volume '%s': status %d", volume.Name, resp.StatusCode)
+				body, _ := io.ReadAll(resp.Body)
+				log.Printf("Erreur lors du compactage du volume '%s': status %d, body: %s", volume.Name, resp.StatusCode, string(body))
 			}
 		}(vol)
 	}
 	wg.Wait()
-	
+	close(offsetMapsChan)
+
+	// Étape 3: Mettre à jour l'index du serveur avec les nouveaux offsets
+	state.Lock()
+	for res := range offsetMapsChan {
+		if len(res.OffsetMap) == 0 {
+			continue // Pas de changement pour ce volume
+		}
+		log.Printf("Mise à jour des offsets pour le volume '%s'...", res.VolumeName)
+		for _, fileMeta := range state.FileIndex {
+			if fileMeta.Deleted {
+				continue
+			}
+			for _, chunkMeta := range fileMeta.Chunks {
+				for _, copyInfo := range chunkMeta.Copies {
+					if copyInfo.VolumeName == res.VolumeName {
+						if newOffset, ok := findNewOffset(copyInfo.Offset, res.OffsetMap); ok {
+							if newOffset != copyInfo.Offset {
+								log.Printf("Offset changé pour chunk (fichier: %s) sur %s: %d -> %d", fileMeta.FileName, res.VolumeName, copyInfo.Offset, newOffset)
+								copyInfo.Offset = newOffset
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	state.Unlock()
+
+	// Étape 4: Sauvegarder l'index mis à jour
+	saveIndex()
+
 	log.Println("Garbage collection terminé")
 }
+
 
 // --- Handlers HTTP ---
 
@@ -344,7 +655,6 @@ func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, "Type de requête ('initial' ou 'heartbeat') manquant.", http.StatusBadRequest)
 }
-
 func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -374,6 +684,11 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	var fileChunks []*ChunkMetadata
 	var totalSize int64
 	chunkIdx := 0
+	var successfulChunks []string
+
+	uploadValid := true
+	var uploadError error
+
 	for {
 		buffer := make([]byte, chunkSize)
 		bytesRead, readErr := io.ReadFull(part, buffer)
@@ -386,6 +701,7 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			buffer = buffer[:bytesRead]
 			isLastChunk = true
 		} else if readErr != nil {
+			go cleanupUploadChunks(successfulChunks)
 			http.Error(w, "Erreur de lecture du chunk: "+readErr.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -393,8 +709,10 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		hash := sha256.Sum256(buffer)
 		checksum := hex.EncodeToString(hash[:])
 
-		targetVolumes, err := selectVolumesForReplication(requiredReplicas, nil)
+		requiredSpace := uint64(len(buffer)) + minFreeSpaceForUpload
+		targetVolumes, err := selectVolumesForReplication(requiredReplicas, nil, requiredSpace)
 		if err != nil {
+			go cleanupUploadChunks(successfulChunks)
 			log.Printf("ERREUR UPLOAD: Impossible de trouver des volumes pour la réplication: %v", err)
 			http.Error(w, "Erreur interne: "+err.Error(), http.StatusServiceUnavailable)
 			return
@@ -406,18 +724,32 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		var wg sync.WaitGroup
 		results := make(chan *ChunkCopy, requiredReplicas)
 		errs := make(chan error, requiredReplicas)
+		successChan := make(chan string, requiredReplicas)
 
 		for _, vol := range targetVolumes {
 			wg.Add(1)
 			go func(v *Volume) {
 				defer wg.Done()
+
+				if !verifyVolumeOnline(v) {
+					errs <- fmt.Errorf("volume '%s' devenu inaccessible avant écriture", v.Name)
+					return
+				}
+
 				diskURL := fmt.Sprintf("http://%s/write_chunk", v.Address)
 				req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(buffer))
 				req.Header.Set("Content-Type", "application/octet-stream")
 				req.Header.Set("X-Chunk-Checksum", checksum)
 
-				resp, err := http.DefaultClient.Do(req)
+				client := &http.Client{Timeout: 30 * time.Second}
+				resp, err := client.Do(req)
 				if err != nil {
+					log.Printf("ERREUR: Volume '%s' inaccessible, marquage hors ligne", v.Name)
+					state.Lock()
+					if vol, exists := state.RegisteredVolumes[v.Name]; exists {
+						vol.Status = "Hors ligne"
+					}
+					state.Unlock()
 					errs <- fmt.Errorf("volume '%s' injoignable: %w", v.Name, err)
 					return
 				}
@@ -428,6 +760,7 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 					errs <- fmt.Errorf("le volume '%s' a refusé l'écriture (status: %d): %s", v.Name, resp.StatusCode, string(body))
 					return
 				}
+
 				var writeResp struct {
 					Offset uint64 `json:"offset"`
 					Size   uint32 `json:"size"`
@@ -436,25 +769,52 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 					errs <- fmt.Errorf("réponse invalide du volume '%s'", v.Name)
 					return
 				}
+
+				successChan <- fmt.Sprintf("%s:%s:%d:%d", v.Name, checksum, writeResp.Offset, writeResp.Size)
 				results <- &ChunkCopy{VolumeName: v.Name, Offset: writeResp.Offset, Size: writeResp.Size}
 			}(vol)
 		}
 		wg.Wait()
 		close(results)
 		close(errs)
+		close(successChan)
 
 		var successfulCopies []*ChunkCopy
+		var partialSuccesses []string
 		for res := range results {
 			successfulCopies = append(successfulCopies, res)
+		}
+		for success := range successChan {
+			partialSuccesses = append(partialSuccesses, success)
 		}
 		for e := range errs {
 			log.Printf("ERREUR UPLOAD: %v", e)
 		}
 
 		if len(successfulCopies) < requiredReplicas {
-			http.Error(w, "Échec de l'écriture sur un ou plusieurs volumes. L'upload est annulé.", http.StatusInternalServerError)
-			return
+			uploadValid = false
+			uploadError = fmt.Errorf("chunk %d: seulement %d copies réussies sur %d requises",
+				chunkIdx, len(successfulCopies), requiredReplicas)
+			break
 		}
+
+		uniqueDisks := make(map[string]bool)
+		state.RLock()
+		for _, copy := range successfulCopies {
+			if vol, exists := state.RegisteredVolumes[copy.VolumeName]; exists {
+				uniqueDisks[vol.DiskID] = true
+			}
+		}
+		state.RUnlock()
+
+		if len(uniqueDisks) < requiredReplicas {
+			uploadValid = false
+			uploadError = fmt.Errorf("chunk %d: copies sur seulement %d disques différents (requis: %d)",
+				chunkIdx, len(uniqueDisks), requiredReplicas)
+			break
+		}
+
+		successfulChunks = append(successfulChunks, partialSuccesses...)
 
 		fileChunks = append(fileChunks, &ChunkMetadata{
 			ChunkIdx: chunkIdx,
@@ -469,17 +829,127 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	state.Lock()
-	state.FileIndex[fileName] = &FileMetadata{
+	if !uploadValid {
+		log.Printf("ERREUR UPLOAD: Upload invalide pour '%s': %v", fileName, uploadError)
+		go cleanupUploadChunks(successfulChunks)
+		http.Error(w, "Échec de l'upload: "+uploadError.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	tempMeta := &FileMetadata{
 		FileName:   fileName,
 		TotalSize:  totalSize,
 		UploadDate: time.Now(),
 		Chunks:     fileChunks,
 	}
+
+	state.Lock()
+	state.FileIndex[fileName] = tempMeta
 	state.Unlock()
+
+	if err := validateUploadedFile(fileName); err != nil {
+		log.Printf("ERREUR VALIDATION: Upload de '%s' échoue à la validation: %v", fileName, err)
+
+		state.Lock()
+		delete(state.FileIndex, fileName)
+		state.Unlock()
+
+		go cleanupUploadChunks(successfulChunks)
+		http.Error(w, "Échec de la validation: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	saveIndex()
-	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé avec succès.", fileName, totalSize, len(fileChunks))
+	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé et validé avec succès.", fileName, totalSize, len(fileChunks))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func cleanupUploadChunks(chunkIdentifiers []string) {
+	if len(chunkIdentifiers) == 0 {
+		return
+	}
+
+	log.Printf("Nettoyage de %d chunks suite à un échec d'upload", len(chunkIdentifiers))
+
+	volumeChunks := make(map[string][]map[string]interface{})
+
+	for _, identifier := range chunkIdentifiers {
+		parts := parseChunkIdentifier(identifier)
+		if len(parts) == 4 {
+			volumeName := parts[0]
+			checksum := parts[1]
+			offset := parts[2]
+			size := parts[3]
+
+			volumeChunks[volumeName] = append(volumeChunks[volumeName], map[string]interface{}{
+				"checksum": checksum,
+				"offset":   offset,
+				"size":     size,
+			})
+		}
+	}
+
+	state.RLock()
+	volumes := make(map[string]*Volume)
+	for name, vol := range state.RegisteredVolumes {
+		if vol.Status == "En ligne" {
+			volumes[name] = vol
+		}
+	}
+	state.RUnlock()
+
+	for volumeName, chunks := range volumeChunks {
+		if vol, ok := volumes[volumeName]; ok {
+			if !verifyVolumeOnline(vol) {
+				log.Printf("SÉCURITÉ: Volume '%s' inaccessible, impossible de nettoyer les chunks orphelins", volumeName)
+				continue
+			}
+
+			cleanupURL := fmt.Sprintf("http://%s/cleanup_orphan", vol.Address)
+			cleanupData := map[string]interface{}{
+				"chunks": chunks,
+			}
+
+			jsonData, _ := json.Marshal(cleanupData)
+			client := &http.Client{Timeout: 10 * time.Second}
+			req, _ := http.NewRequest("POST", cleanupURL, bytes.NewReader(jsonData))
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("Erreur lors du nettoyage des chunks orphelins sur '%s': %v", volumeName, err)
+				state.Lock()
+				if volume, exists := state.RegisteredVolumes[volumeName]; exists {
+					volume.Status = "Hors ligne"
+				}
+				state.Unlock()
+			} else {
+				resp.Body.Close()
+				log.Printf("Chunks orphelins nettoyés sur le volume '%s'", volumeName)
+			}
+		}
+	}
+}
+
+func parseChunkIdentifier(identifier string) []string {
+	parts := make([]string, 0, 4)
+	current := ""
+	colonCount := 0
+
+	for _, char := range identifier {
+		if char == ':' && colonCount < 3 {
+			parts = append(parts, current)
+			current = ""
+			colonCount++
+		} else {
+			current += string(char)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+
+	return parts
 }
 
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
@@ -507,28 +977,42 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 
 		for _, copyInfo := range chunk.Copies {
 			if copyInfo.Deleted {
-				continue // Ignorer les copies marquées comme supprimées
+				continue
 			}
-			
+
 			state.RLock()
 			volume, volOK := state.RegisteredVolumes[copyInfo.VolumeName]
 			state.RUnlock()
 
-			if !volOK || volume.Status != "En ligne" {
-				lastError = fmt.Errorf("volume '%s' hors ligne", copyInfo.VolumeName)
+			if !volOK {
+				lastError = fmt.Errorf("volume '%s' non trouvé", copyInfo.VolumeName)
+				continue
+			}
+
+			if !verifyVolumeOnline(volume) {
+				lastError = fmt.Errorf("volume '%s' hors ligne (vérification temps réel)", copyInfo.VolumeName)
 				continue
 			}
 
 			diskURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", volume.Address, copyInfo.Offset, copyInfo.Size)
-			resp, err := http.Get(diskURL)
+
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Get(diskURL)
 			if err != nil {
+				log.Printf("SÉCURITÉ: Erreur de lecture détectée sur '%s', marquage hors ligne", volume.Name)
+				state.Lock()
+				if vol, exists := state.RegisteredVolumes[copyInfo.VolumeName]; exists {
+					vol.Status = "Hors ligne"
+				}
+				state.Unlock()
 				lastError = fmt.Errorf("erreur de connexion à '%s': %w", volume.Name, err)
 				continue
 			}
 
 			if resp.StatusCode != http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastError = fmt.Errorf("échec de lecture sur '%s' (status: %d)", volume.Name, resp.StatusCode)
+				lastError = fmt.Errorf("échec de lecture sur '%s' (status: %d): %s", volume.Name, resp.StatusCode, string(bodyBytes))
 				continue
 			}
 
@@ -569,8 +1053,7 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
-	
-	// Copier les métadonnées pour éviter de garder le lock trop longtemps
+
 	state.RLock()
 	meta, exists := state.FileIndex[filename]
 	if !exists {
@@ -578,14 +1061,13 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	
-	// Créer une copie des chunks pour le traitement en arrière-plan
+
 	var chunksToDelete []struct {
 		volumeName string
 		offset     uint64
 		size       uint32
 	}
-	
+
 	for _, chunk := range meta.Chunks {
 		for _, copy := range chunk.Copies {
 			chunksToDelete = append(chunksToDelete, struct {
@@ -596,8 +1078,7 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.RUnlock()
-	
-	// Maintenant marquer comme supprimé avec un lock séparé
+
 	state.Lock()
 	if meta, exists := state.FileIndex[filename]; exists {
 		meta.Deleted = true
@@ -608,23 +1089,20 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.Unlock()
-	
+
 	saveIndex()
 	log.Printf("Fichier '%s' marqué pour suppression", filename)
-	
-	// Envoyer les commandes de suppression aux volumes en arrière-plan
+
 	go func() {
 		volumeChunks := make(map[string][]map[string]interface{})
-		
-		// Grouper les chunks par volume
+
 		for _, chunk := range chunksToDelete {
 			volumeChunks[chunk.volumeName] = append(volumeChunks[chunk.volumeName], map[string]interface{}{
 				"offset": chunk.offset,
 				"size":   chunk.size,
 			})
 		}
-		
-		// Envoyer aux volumes en ligne
+
 		state.RLock()
 		volumes := make(map[string]*Volume)
 		for name, vol := range state.RegisteredVolumes {
@@ -633,18 +1111,18 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		state.RUnlock()
-		
+
 		for volumeName, chunks := range volumeChunks {
 			if vol, ok := volumes[volumeName]; ok {
 				deleteURL := fmt.Sprintf("http://%s/mark_deleted", vol.Address)
 				deleteData := map[string]interface{}{
 					"chunks": chunks,
 				}
-				
+
 				jsonData, _ := json.Marshal(deleteData)
 				req, _ := http.NewRequest("POST", deleteURL, bytes.NewReader(jsonData))
 				req.Header.Set("Content-Type", "application/json")
-				
+
 				client := &http.Client{Timeout: 5 * time.Second}
 				resp, err := client.Do(req)
 				if err != nil {
@@ -656,7 +1134,7 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	
+
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -685,7 +1163,7 @@ func runRepairProcess() {
 	state.RLock()
 	for filename, meta := range state.FileIndex {
 		if meta.Deleted {
-			continue // Ignorer les fichiers supprimés
+			continue
 		}
 		for _, chunk := range meta.Chunks {
 			var onlineCopies []*ChunkCopy
@@ -729,7 +1207,9 @@ func runRepairProcess() {
 			state.RUnlock()
 			continue
 		}
-		targetVolumes, err := selectVolumesForReplication(1, excludeDiskIDs)
+
+		requiredSpace := uint64(job.sourceCopy.Size) + minFreeSpaceForUpload
+		targetVolumes, err := selectVolumesForReplication(1, excludeDiskIDs, requiredSpace)
 		state.RUnlock()
 
 		if err != nil {
@@ -830,42 +1310,30 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	for _, f := range state.FileIndex {
 		if f.Deleted {
 			deletedFilesCount++
-			continue // Ne pas afficher les fichiers supprimés
+			continue
 		}
-		
-		isUnavailable := false
-		isDegraded := false
-		for _, chunk := range f.Chunks {
-			onlineCopies := 0
-			onlineCopyDisks := make(map[string]bool)
-			for _, copyInfo := range chunk.Copies {
-				if !copyInfo.Deleted {
-					if vol, ok := state.RegisteredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
-						onlineCopies++
-						onlineCopyDisks[vol.DiskID] = true
+
+		f.Status = calculateFileStatus(f)
+
+		if f.Status == "Dégradé" {
+			filesInDegradedState = true
+
+			for _, chunk := range f.Chunks {
+				onlineCopyDisks := make(map[string]bool)
+				for _, copyInfo := range chunk.Copies {
+					if !copyInfo.Deleted {
+						if vol, ok := state.RegisteredVolumes[copyInfo.VolumeName]; ok && vol.Status == "En ligne" {
+							onlineCopyDisks[vol.DiskID] = true
+						}
 					}
 				}
-			}
-			if onlineCopies == 0 {
-				isUnavailable = true
-				break
-			}
-			if onlineCopies < requiredReplicas {
-				isDegraded = true
 				if len(onlinePhysicalDisks) > len(onlineCopyDisks) {
 					isRepairPossible = true
+					break
 				}
 			}
 		}
 
-		if isUnavailable {
-			f.Status = "Indisponible"
-		} else if isDegraded {
-			f.Status = "Dégradé"
-			filesInDegradedState = true
-		} else {
-			f.Status = "Protégé"
-		}
 		files = append(files, f)
 	}
 
