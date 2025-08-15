@@ -1,8 +1,9 @@
-// volume.go
 package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,7 +23,7 @@ const (
 
 type Config struct {
 	Name    string
-	DiskID  string // NOUVEAU: Identifiant du disque physique
+	DiskID  string
 	Storage string
 	Server  string
 	Address string
@@ -38,7 +39,7 @@ var (
 
 func main() {
 	name := flag.String("name", "", "Nom unique du volume (requis)")
-	diskID := flag.String("disk", "", "Identifiant du disque physique parent (requis)") // NOUVEAU
+	diskID := flag.String("disk", "", "Identifiant du disque physique parent (requis)")
 	storage := flag.String("storage", ".", "Emplacement de stockage pour le fichier de volume")
 	server := flag.String("server", "localhost:8080", "Adresse IP:port du serveur d'index")
 	address := flag.String("address", "localhost:9000", "Adresse IP:port de ce volume pour écouter")
@@ -50,7 +51,7 @@ func main() {
 
 	diskConfig = Config{
 		Name:    *name,
-		DiskID:  *diskID, // NOUVEAU
+		DiskID:  *diskID,
 		Storage: *storage,
 		Server:  *server,
 		Address: *address,
@@ -112,12 +113,11 @@ func getFreeSpaceBytes() uint64 {
 	return totalBytes - usedBytes
 }
 
-// buildStatusPayload prépare la charge utile JSON pour le serveur.
 func buildStatusPayload(requestType string) ([]byte, error) {
 	status := map[string]interface{}{
 		"type":       requestType,
 		"name":       diskConfig.Name,
-		"diskId":     diskConfig.DiskID, // NOUVEAU
+		"diskId":     diskConfig.DiskID,
 		"address":    diskConfig.Address,
 		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
 		"freeSpace":  getFreeSpaceBytes(),
@@ -183,28 +183,54 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
 		return
 	}
+
+	expectedChecksum := r.Header.Get("X-Chunk-Checksum")
+	if expectedChecksum == "" {
+		http.Error(w, "Checksum manquant dans l'en-tête X-Chunk-Checksum", http.StatusBadRequest)
+		return
+	}
+
+	chunkData, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
+		return
+	}
+
+	hash := sha256.Sum256(chunkData)
+	actualChecksum := hex.EncodeToString(hash[:])
+
+	if actualChecksum != expectedChecksum {
+		log.Printf("ERREUR: Checksum invalide pour l'écriture. Attendu: %s, Reçu: %s", expectedChecksum, actualChecksum)
+		http.Error(w, "Checksum invalide. Les données ont pu être corrompues pendant le transfert.", http.StatusBadRequest)
+		return
+	}
+
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
+
 	file, err := os.OpenFile(volumePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
+
 	offset, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
-	bytesWritten, err := io.Copy(file, r.Body)
+
+	bytesWritten, err := file.Write(chunkData)
 	if err != nil {
 		http.Error(w, "Erreur lors de l'écriture du chunk", http.StatusInternalServerError)
 		return
 	}
-	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)} // Cast en uint32
+
+	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-	log.Printf("Chunk écrit avec succès (taille: %d, offset: %d)", bytesWritten, offset)
+	log.Printf("Chunk écrit (checksum OK: %s...): taille %d, offset %d", actualChecksum[:8], bytesWritten, offset)
 }
 
 func readChunkHandler(w http.ResponseWriter, r *http.Request) {
@@ -215,20 +241,29 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Paramètres 'offset' et 'size' invalides", http.StatusBadRequest)
 		return
 	}
+
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
+
 	file, err := os.Open(volumePath)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
-	_, err = file.Seek(offset, io.SeekStart)
+
+	chunkData := make([]byte, size)
+	_, err = file.ReadAt(chunkData, offset)
 	if err != nil {
-		http.Error(w, "Offset de lecture invalide", http.StatusInternalServerError)
+		http.Error(w, "Offset de lecture invalide ou erreur de lecture", http.StatusInternalServerError)
 		return
 	}
+
+	hash := sha256.Sum256(chunkData)
+	actualChecksum := hex.EncodeToString(hash[:])
+	w.Header().Set("X-Chunk-Checksum", actualChecksum)
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	io.CopyN(w, file, size)
+	w.Write(chunkData)
 }
