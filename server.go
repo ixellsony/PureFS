@@ -47,7 +47,6 @@ func (fm *FileMetadata) TotalSizeMB() float64 {
 	return float64(fm.TotalSize) / (1024 * 1024)
 }
 
-// MODIFICATION 1: Ajout du champ Status
 type Disk struct {
 	Name       string    `json:"name"`
 	Address    string    `json:"address"`
@@ -137,7 +136,6 @@ func saveIndex() {
 	}
 }
 
-// MODIFICATION 2: Sélectionne un disque uniquement parmi ceux qui sont "En ligne"
 func selectDisk() *Disk {
 	state.Lock()
 	defer state.Unlock()
@@ -162,7 +160,6 @@ func selectDisk() *Disk {
 	return selected
 }
 
-// MODIFICATION 3: Ne supprime plus les disques, mais met à jour leur statut
 func cleanupInactiveDisks() {
 	ticker := time.NewTicker(30 * time.Second) // Vérification toutes les 30 secondes
 	defer ticker.Stop()
@@ -170,7 +167,6 @@ func cleanupInactiveDisks() {
 	for range ticker.C {
 		state.Lock()
 		for _, disk := range state.RegisteredDisks {
-			// Si un disque n'a pas été vu depuis 45 secondes et qu'il est "En ligne"
 			if time.Since(disk.LastSeen) > 45*time.Second && disk.Status == "En ligne" {
 				log.Printf("Disque '%s' inactif. Marquage comme Hors ligne.", disk.Name)
 				disk.Status = "Hors ligne"
@@ -182,36 +178,65 @@ func cleanupInactiveDisks() {
 
 // --- Handlers HTTP ---
 
-// MODIFICATION 4: Met à jour le statut du disque à "En ligne" à chaque heartbeat
+// MODIFICATION MAJEURE: La logique d'enregistrement gère les conflits de nom.
 func registerDiskHandler(w http.ResponseWriter, r *http.Request) {
 	var diskData Disk
 	if err := json.NewDecoder(r.Body).Decode(&diskData); err != nil {
 		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if diskData.Name == "" {
+		http.Error(w, "Le nom du disque ne peut pas être vide.", http.StatusBadRequest)
+		return
+	}
 
 	state.Lock()
-	disk, exists := state.RegisteredDisks[diskData.Name]
-	if !exists {
-		// Enregistre un nouveau disque s'il n'existe pas
-		disk = &Disk{Name: diskData.Name}
-		state.RegisteredDisks[diskData.Name] = disk
-		log.Printf("Nouveau disque enregistré: %s", diskData.Name)
-	}
+	defer state.Unlock()
 
-	// Met à jour les informations et le statut
-	disk.Address = diskData.Address
-	disk.TotalSpace = diskData.TotalSpace
-	disk.FreeSpace = diskData.FreeSpace
-	disk.LastSeen = time.Now()
-	disk.Status = "En ligne" // Toujours marquer comme en ligne lors d'un heartbeat
+	existingDisk, exists := state.RegisteredDisks[diskData.Name]
 
-	state.Unlock()
-
-	// Logique de logging améliorée pour montrer quand un disque revient en ligne
+	// Cas 1: Le disque est déjà connu.
 	if exists {
-		log.Printf("Heartbeat de '%s'. Statut: En ligne.", disk.Name)
+		// Cas 1a: CONFLIT. Un disque avec ce nom est déjà considéré comme "En ligne".
+		// On refuse la connexion pour éviter d'avoir deux volumes actifs avec le même nom.
+		// Cela se produit lors de l'enregistrement initial d'un volume dont le nom est déjà pris.
+		if existingDisk.Status == "En ligne" {
+			// On considère que c'est un heartbeat légitime s'il vient de la même adresse.
+			// (Simple protection, pourrait être améliorée)
+			if existingDisk.Address == diskData.Address {
+				existingDisk.LastSeen = time.Now()
+				existingDisk.FreeSpace = diskData.FreeSpace
+				log.Printf("Heartbeat de '%s' (même adresse).", existingDisk.Name)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			log.Printf("Conflit de nom de volume : Tentative d'enregistrement pour '%s' depuis %s alors qu'il est déjà en ligne à l'adresse %s.", diskData.Name, diskData.Address, existingDisk.Address)
+			http.Error(w, fmt.Sprintf("Impossible d'enregistrer le volume : un volume nommé '%s' est déjà connecté au serveur.", diskData.Name), http.StatusConflict)
+			return
+		}
+
+		// Cas 1b: RECONNEXION. Le disque était "Hors ligne" et revient. On met à jour ses informations.
+		log.Printf("Le disque '%s' est de retour en ligne.", diskData.Name)
+		existingDisk.Address = diskData.Address
+		existingDisk.TotalSpace = diskData.TotalSpace
+		existingDisk.FreeSpace = diskData.FreeSpace
+		existingDisk.LastSeen = time.Now()
+		existingDisk.Status = "En ligne"
+
+	} else {
+		// Cas 2: NOUVEAU DISQUE. Il n'a jamais été vu auparavant.
+		log.Printf("Nouveau disque enregistré : %s", diskData.Name)
+		state.RegisteredDisks[diskData.Name] = &Disk{
+			Name:       diskData.Name,
+			Address:    diskData.Address,
+			TotalSpace: diskData.TotalSpace,
+			FreeSpace:  diskData.FreeSpace,
+			LastSeen:   time.Now(),
+			Status:     "En ligne",
+		}
 	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -265,7 +290,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Content-Type", "application/octet-stream")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			// Si un disque est injoignable, le marquer immédiatement comme hors ligne
 			state.Lock()
 			if d, ok := state.RegisteredDisks[targetDisk.Name]; ok {
 				d.Status = "Hors ligne"
@@ -316,7 +340,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// MODIFICATION 5: Vérifie le statut du disque avant de tenter de lire le chunk
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
@@ -327,7 +350,6 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// Créer une copie pour éviter les problèmes de concurrence pendant l'itération
 	chunks := make([]*IndexEntry, len(meta.Chunks))
 	copy(chunks, meta.Chunks)
 	state.RUnlock()
@@ -361,7 +383,6 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 		_, err = io.Copy(w, resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			// Le client a probablement fermé la connexion, on arrête d'envoyer
 			return
 		}
 	}
@@ -393,7 +414,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// MODIFICATION 6: Le template HTML affiche le statut et change le style pour les disques hors ligne
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
