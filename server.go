@@ -54,6 +54,9 @@ type Disk struct {
 	FreeSpace  uint64    `json:"freeSpace"`
 	LastSeen   time.Time `json:"-"`
 	Status     string    `json:"status"` // "En ligne" ou "Hors ligne"
+	// MODIFICATION: Ajout du champ Type pour différencier les requêtes.
+	// omitempty signifie que si le champ est vide, il ne sera pas inclus dans le JSON (utile pour l'encodage).
+	Type string `json:"type,omitempty"`
 }
 
 func (d *Disk) FreeSpaceGB() float64 {
@@ -74,7 +77,6 @@ var state = GlobalState{
 var webTemplate *template.Template
 
 // --- Fonctions Principales ---
-
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadIndex()
@@ -98,8 +100,7 @@ func main() {
 	}
 }
 
-// --- Logique Métier (Index, Sélection de disque, etc.) ---
-
+// --- Logique Métier ---
 func loadIndex() {
 	state.Lock()
 	defer state.Unlock()
@@ -120,7 +121,6 @@ func loadIndex() {
 		log.Printf("Index chargé. %d fichiers indexés.", len(state.FileIndex))
 	}
 }
-
 func saveIndex() {
 	state.RLock()
 	defer state.RUnlock()
@@ -135,22 +135,18 @@ func saveIndex() {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
 	}
 }
-
 func selectDisk() *Disk {
 	state.Lock()
 	defer state.Unlock()
-
 	var onlineDisks []*Disk
 	for _, d := range state.RegisteredDisks {
 		if d.Status == "En ligne" {
 			onlineDisks = append(onlineDisks, d)
 		}
 	}
-
 	if len(onlineDisks) == 0 {
 		return nil
 	}
-
 	sort.Slice(onlineDisks, func(i, j int) bool { return onlineDisks[i].Name < onlineDisks[j].Name })
 	if state.nextDiskIdx >= len(onlineDisks) {
 		state.nextDiskIdx = 0
@@ -159,11 +155,9 @@ func selectDisk() *Disk {
 	state.nextDiskIdx++
 	return selected
 }
-
 func cleanupInactiveDisks() {
-	ticker := time.NewTicker(30 * time.Second) // Vérification toutes les 30 secondes
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		state.Lock()
 		for _, disk := range state.RegisteredDisks {
@@ -178,7 +172,7 @@ func cleanupInactiveDisks() {
 
 // --- Handlers HTTP ---
 
-// MODIFICATION MAJEURE: La logique d'enregistrement gère les conflits de nom.
+// MODIFICATION MAJEURE: Refonte complète de la logique d'enregistrement.
 func registerDiskHandler(w http.ResponseWriter, r *http.Request) {
 	var diskData Disk
 	if err := json.NewDecoder(r.Body).Decode(&diskData); err != nil {
@@ -195,51 +189,52 @@ func registerDiskHandler(w http.ResponseWriter, r *http.Request) {
 
 	existingDisk, exists := state.RegisteredDisks[diskData.Name]
 
-	// Cas 1: Le disque est déjà connu.
-	if exists {
-		// Cas 1a: CONFLIT. Un disque avec ce nom est déjà considéré comme "En ligne".
-		// On refuse la connexion pour éviter d'avoir deux volumes actifs avec le même nom.
-		// Cela se produit lors de l'enregistrement initial d'un volume dont le nom est déjà pris.
-		if existingDisk.Status == "En ligne" {
-			// On considère que c'est un heartbeat légitime s'il vient de la même adresse.
-			// (Simple protection, pourrait être améliorée)
-			if existingDisk.Address == diskData.Address {
-				existingDisk.LastSeen = time.Now()
-				existingDisk.FreeSpace = diskData.FreeSpace
-				log.Printf("Heartbeat de '%s' (même adresse).", existingDisk.Name)
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
-			log.Printf("Conflit de nom de volume : Tentative d'enregistrement pour '%s' depuis %s alors qu'il est déjà en ligne à l'adresse %s.", diskData.Name, diskData.Address, existingDisk.Address)
+	// --- LOGIQUE POUR L'ENREGISTREMENT INITIAL ---
+	if diskData.Type == "initial" {
+		// CONFLIT: Un disque avec ce nom existe déjà et est en ligne. On refuse.
+		if exists && existingDisk.Status == "En ligne" {
+			log.Printf("Conflit de nom de volume : Tentative d'enregistrement initial pour '%s' alors qu'il est déjà en ligne.", diskData.Name)
 			http.Error(w, fmt.Sprintf("Impossible d'enregistrer le volume : un volume nommé '%s' est déjà connecté au serveur.", diskData.Name), http.StatusConflict)
 			return
 		}
-
-		// Cas 1b: RECONNEXION. Le disque était "Hors ligne" et revient. On met à jour ses informations.
-		log.Printf("Le disque '%s' est de retour en ligne.", diskData.Name)
+		// NOUVEAU DISQUE ou RECONNEXION D'UN DISQUE HORS LIGNE.
+		if !exists {
+			log.Printf("Nouveau disque enregistré : %s", diskData.Name)
+			existingDisk = &Disk{Name: diskData.Name}
+			state.RegisteredDisks[diskData.Name] = existingDisk
+		} else {
+			log.Printf("Le disque '%s' (précédemment hors ligne) est de retour.", diskData.Name)
+		}
+		// Mise à jour des informations
 		existingDisk.Address = diskData.Address
 		existingDisk.TotalSpace = diskData.TotalSpace
 		existingDisk.FreeSpace = diskData.FreeSpace
 		existingDisk.LastSeen = time.Now()
 		existingDisk.Status = "En ligne"
-
-	} else {
-		// Cas 2: NOUVEAU DISQUE. Il n'a jamais été vu auparavant.
-		log.Printf("Nouveau disque enregistré : %s", diskData.Name)
-		state.RegisteredDisks[diskData.Name] = &Disk{
-			Name:       diskData.Name,
-			Address:    diskData.Address,
-			TotalSpace: diskData.TotalSpace,
-			FreeSpace:  diskData.FreeSpace,
-			LastSeen:   time.Now(),
-			Status:     "En ligne",
-		}
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-}
+	// --- LOGIQUE POUR LES HEARTBEATS ---
+	if diskData.Type == "heartbeat" {
+		if !exists {
+			log.Printf("Avertissement : Heartbeat reçu pour un disque inconnu '%s'. Enregistrement...", diskData.Name)
+			// On pourrait le traiter comme un enregistrement initial pour plus de robustesse.
+			existingDisk = &Disk{Name: diskData.Name}
+			state.RegisteredDisks[diskData.Name] = existingDisk
+		}
+		log.Printf("Heartbeat reçu de '%s'.", diskData.Name)
+		existingDisk.Address = diskData.Address
+		existingDisk.FreeSpace = diskData.FreeSpace
+		existingDisk.LastSeen = time.Now()
+		existingDisk.Status = "En ligne"
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
+	// Si aucun type n'est spécifié (ancienne version ou erreur)
+	http.Error(w, "Type de requête ('initial' ou 'heartbeat') manquant.", http.StatusBadRequest)
+}
 func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -339,7 +334,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé avec succès.", fileName, totalSize, len(chunks))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
-
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
@@ -387,7 +381,6 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
-
 func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	state.RLock()
 	defer state.RUnlock()
@@ -414,6 +407,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Le template HTML reste le même
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
