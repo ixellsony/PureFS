@@ -27,6 +27,7 @@ const (
 	chunkSize             = 8 * 1024 * 1024     // 8 MB
 	requiredReplicas      = 2
 	minFreeSpaceForUpload = 100 * 1024 * 1024 // 100 MB minimum
+	gcJournalPath         = "gc.journal.tmp"    // Chemin pour le fichier de journal du GC
 )
 
 // --- Structures de Données ---
@@ -78,6 +79,12 @@ type GlobalState struct {
 	RegisteredVolumes map[string]*Volume
 }
 
+// Structure pour le journal du Garbage Collection
+type GCJournal struct {
+	// Fait le lien entre un nom de volume et sa map d'offsets (ancien offset -> nouvel offset)
+	VolumeOffsetMaps map[string]map[uint64]uint64
+}
+
 var state = GlobalState{
 	FileIndex:         make(map[string]*FileMetadata),
 	RegisteredVolumes: make(map[string]*Volume),
@@ -88,6 +95,8 @@ var webTemplate *template.Template
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadIndex()
+	replayGCJournalIfExists() // On vérifie s'il faut reprendre une opération de GC interrompue
+
 	go cleanupInactiveVolumes()
 	go garbageCollectionWorker()
 
@@ -174,6 +183,74 @@ func saveIndex() {
 	}
 
 	log.Printf("Index sauvegardé de manière atomique avec %d fichiers", len(indexCopy))
+}
+
+// Fonction pour rejouer le journal de GC si le serveur a crashé
+func replayGCJournalIfExists() {
+	file, err := os.Open(gcJournalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Le journal n'existe pas, c'est le cas normal.
+			return
+		}
+		log.Fatalf("ERREUR CRITIQUE: Impossible d'ouvrir le journal de GC existant: %v", err)
+	}
+	defer file.Close()
+
+	log.Println("ATTENTION: Journal de Garbage Collection trouvé. Démarrage de la procédure de récupération...")
+
+	var journalData GCJournal
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&journalData); err != nil {
+		log.Fatalf("ERREUR CRITIQUE: Impossible de décoder le journal de GC. Intervention manuelle requise. Fichier: %s. Erreur: %v", gcJournalPath, err)
+	}
+	file.Close()
+
+	// Appliquer les changements du journal à l'index en mémoire
+	applyOffsetMaps(&journalData)
+
+	// Sauvegarder l'index maintenant corrigé
+	log.Println("Sauvegarde de l'index récupéré...")
+	saveIndex()
+
+	// Supprimer le journal puisque la récupération est terminée
+	if err := os.Remove(gcJournalPath); err != nil {
+		log.Printf("ERREUR CRITIQUE: Impossible de supprimer le journal de GC après récupération: %v. Veuillez le supprimer manuellement.", err)
+	} else {
+		log.Println("Récupération depuis le journal de GC terminée avec succès.")
+	}
+}
+
+// Fonction pour appliquer les maps d'offset (factorisée pour être utilisée par le GC et la récupération)
+func applyOffsetMaps(journalData *GCJournal) {
+	state.Lock()
+	defer state.Unlock()
+
+	log.Println("Application des mises à jour d'offset depuis le journal de GC...")
+	for volumeName, offsetMap := range journalData.VolumeOffsetMaps {
+		if len(offsetMap) == 0 {
+			continue
+		}
+		log.Printf("Mise à jour des offsets pour le volume '%s'...", volumeName)
+		for _, fileMeta := range state.FileIndex {
+			if fileMeta.Deleted {
+				continue
+			}
+			for _, chunkMeta := range fileMeta.Chunks {
+				for _, copyInfo := range chunkMeta.Copies {
+					if copyInfo.VolumeName == volumeName {
+						if newOffset, ok := findNewOffset(copyInfo.Offset, offsetMap); ok {
+							if newOffset != copyInfo.Offset {
+								log.Printf("Offset changé pour chunk (fichier: %s) sur %s: %d -> %d", fileMeta.FileName, volumeName, copyInfo.Offset, newOffset)
+								copyInfo.Offset = newOffset
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	log.Println("Application des mises à jour d'offset terminée.")
 }
 
 func verifyVolumeOnline(volume *Volume) bool {
@@ -434,14 +511,13 @@ func cleanupInactiveVolumes() {
 }
 
 func garbageCollectionWorker() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(24 * time.Hour) // Le GC peut être espacé
 	defer ticker.Stop()
 	for range ticker.C {
 		runGarbageCollection()
 	}
 }
 
-// CORRECTION: Nouvelle fonction pour trouver le nouvel offset après compactage
 func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool) {
 	if offsetMap == nil || len(offsetMap) == 0 {
 		return 0, false
@@ -470,8 +546,7 @@ func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool)
 	return 0, false
 }
 
-
-// CORRECTION: Fonction de garbage collection mise à jour
+// La fonction de garbage collection est maintenant transactionnelle grâce au journal
 func runGarbageCollection() {
 	log.Println("Lancement du garbage collection...")
 
@@ -500,10 +575,7 @@ func runGarbageCollection() {
 	var onlineVolumes []*Volume
 	for _, v := range state.RegisteredVolumes {
 		if v.Status == "En ligne" {
-			onlineVolumes = append(onlineVolumes, &Volume{
-				Name:    v.Name,
-				Address: v.Address,
-			})
+			onlineVolumes = append(onlineVolumes, v)
 		}
 	}
 	state.RUnlock()
@@ -521,7 +593,7 @@ func runGarbageCollection() {
 			defer wg.Done()
 			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
 			// Le compactage peut prendre du temps, on augmente le timeout
-			client := &http.Client{Timeout: 5 * time.Minute}
+			client := &http.Client{Timeout: 15 * time.Minute}
 			resp, err := client.Post(compactURL, "application/json", nil)
 			if err != nil {
 				log.Printf("Erreur lors de la demande de compactage au volume '%s': %v", volume.Name, err)
@@ -539,7 +611,7 @@ func runGarbageCollection() {
 					return
 				}
 
-				if compactResp.OffsetMap != nil {
+				if compactResp.OffsetMap != nil && len(compactResp.OffsetMap) > 0 {
 					// Convertir la map de string en map[uint64]uint64
 					newOffsetMap := make(map[uint64]uint64)
 					for oldOffStr, newOff := range compactResp.OffsetMap {
@@ -563,39 +635,62 @@ func runGarbageCollection() {
 	wg.Wait()
 	close(offsetMapsChan)
 
-	// Étape 3: Mettre à jour l'index du serveur avec les nouveaux offsets
-	state.Lock()
+	// Étape 3: Collecter tous les résultats et préparer le journal
+	journalData := GCJournal{
+		VolumeOffsetMaps: make(map[string]map[uint64]uint64),
+	}
+	hasChanges := false
 	for res := range offsetMapsChan {
-		if len(res.OffsetMap) == 0 {
-			continue // Pas de changement pour ce volume
-		}
-		log.Printf("Mise à jour des offsets pour le volume '%s'...", res.VolumeName)
-		for _, fileMeta := range state.FileIndex {
-			if fileMeta.Deleted {
-				continue
-			}
-			for _, chunkMeta := range fileMeta.Chunks {
-				for _, copyInfo := range chunkMeta.Copies {
-					if copyInfo.VolumeName == res.VolumeName {
-						if newOffset, ok := findNewOffset(copyInfo.Offset, res.OffsetMap); ok {
-							if newOffset != copyInfo.Offset {
-								log.Printf("Offset changé pour chunk (fichier: %s) sur %s: %d -> %d", fileMeta.FileName, res.VolumeName, copyInfo.Offset, newOffset)
-								copyInfo.Offset = newOffset
-							}
-						}
-					}
-				}
-			}
+		if len(res.OffsetMap) > 0 {
+			journalData.VolumeOffsetMaps[res.VolumeName] = res.OffsetMap
+			hasChanges = true
 		}
 	}
-	state.Unlock()
 
-	// Étape 4: Sauvegarder l'index mis à jour
+	if !hasChanges {
+		log.Println("Garbage collection terminé. Aucun changement d'offset à appliquer.")
+		return
+	}
+
+	// Étape 4: Écrire les changements dans un journal AVANT de modifier l'état en mémoire
+	log.Println("Écriture du journal de transaction pour le GC...")
+	journalFile, err := os.Create(gcJournalPath)
+	if err != nil {
+		log.Printf("ERREUR CRITIQUE: Impossible de créer le journal de GC: %v. Abandon du GC.", err)
+		return
+	}
+	encoder := gob.NewEncoder(journalFile)
+	if err := encoder.Encode(&journalData); err != nil {
+		journalFile.Close()
+		os.Remove(gcJournalPath)
+		log.Printf("ERREUR CRITIQUE: Impossible d'écrire dans le journal de GC: %v. Abandon.", err)
+		return
+	}
+	// On s'assure que le journal est bien écrit sur le disque physique
+	if err := journalFile.Sync(); err != nil {
+		journalFile.Close()
+		os.Remove(gcJournalPath)
+		log.Printf("ERREUR CRITIQUE: Impossible de synchroniser le journal de GC sur le disque: %v. Abandon.", err)
+		return
+	}
+	journalFile.Close()
+	log.Println("Journal de transaction du GC écrit avec succès.")
+
+	// Étape 5: Appliquer les changements à l'index en mémoire
+	// (Le serveur crashe ici. Au redémarrage, replayGCJournalIfExists() corrigera l'état)
+	applyOffsetMaps(&journalData)
+
+	// Étape 6: Sauvegarder l'index principal mis à jour
+	// (Le serveur crashe ici. Au redémarrage, replayGCJournalIfExists() chargera l'ancien index, le corrigera et le sauvegardera)
 	saveIndex()
 
-	log.Println("Garbage collection terminé")
-}
+	// Étape 7: Supprimer le journal, l'opération est terminée
+	if err := os.Remove(gcJournalPath); err != nil {
+		log.Printf("AVERTISSEMENT: Impossible de supprimer le journal de GC après succès: %v", err)
+	}
 
+	log.Println("Garbage collection terminé et index mis à jour de manière transactionnelle.")
+}
 
 // --- Handlers HTTP ---
 
