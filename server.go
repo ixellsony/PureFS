@@ -120,6 +120,7 @@ func main() {
 	r.HandleFunc("/api/files/download/{filename}", downloadFileHandler).Methods("GET")
 	r.HandleFunc("/api/files/delete/{filename}", deleteFileHandler).Methods("POST")
 	r.HandleFunc("/api/repair", repairHandler).Methods("POST")
+	r.HandleFunc("/api/cleanup_replicas", cleanupReplicasHandler).Methods("POST") // NOUVELLE ROUTE
 	r.HandleFunc("/api/gc", garbageCollectionHandler).Methods("POST")
 	r.HandleFunc("/", webUIHandler).Methods("GET")
 
@@ -347,6 +348,7 @@ func selectVolumesForReplication(count int, excludeDisks []string, requiredSpace
 	return result, nil
 }
 
+// MODIFIÉ: Ajout de la détection de sur-réplication
 func calculateFileStatus(meta *FileMetadata) string {
 	if meta.Deleted {
 		return "Supprimé"
@@ -354,6 +356,7 @@ func calculateFileStatus(meta *FileMetadata) string {
 
 	allChunksProtected := true
 	hasUnavailableChunk := false
+	hasOverReplicatedChunk := false // Flag pour la sur-réplication
 
 	state.RLock()
 	defer state.RUnlock()
@@ -372,10 +375,14 @@ func calculateFileStatus(meta *FileMetadata) string {
 				uniqueDisks[vol.DiskID] = true
 			}
 		}
+		
+		if onlineCopies > requiredReplicas {
+			hasOverReplicatedChunk = true
+		}
 
 		if onlineCopies == 0 {
 			hasUnavailableChunk = true
-			break
+			break 
 		}
 
 		if onlineCopies < requiredReplicas || len(uniqueDisks) < requiredReplicas {
@@ -389,6 +396,10 @@ func calculateFileStatus(meta *FileMetadata) string {
 
 	if !allChunksProtected {
 		return "Dégradé"
+	}
+	
+	if hasOverReplicatedChunk {
+		return "Sur-protégé"
 	}
 
 	return "Protégé"
@@ -1245,6 +1256,104 @@ func garbageCollectionHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// NOUVEAU: Handler pour nettoyer les copies en surplus
+func cleanupReplicasHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("Lancement du nettoyage des répliques excédentaires en arrière-plan...")
+	go runCleanupReplicasProcess()
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// NOUVEAU: Processus de nettoyage des copies en surplus
+func runCleanupReplicasProcess() {
+	log.Println("Début du processus de nettoyage des répliques excédentaires.")
+
+	volumeDeletionMap := make(map[string][]map[string]interface{})
+	cleanedCount := 0
+
+	state.Lock()
+
+	filesToProcess := make([]*FileMetadata, 0, len(state.FileIndex))
+	for _, meta := range state.FileIndex {
+		if !meta.Deleted {
+			filesToProcess = append(filesToProcess, meta)
+		}
+	}
+
+	onlineVolumes := make(map[string]*Volume)
+	for name, vol := range state.RegisteredVolumes {
+		if vol.Status == "En ligne" {
+			onlineVolumes[name] = vol
+		}
+	}
+
+	for _, meta := range filesToProcess {
+		for chunkIdx, chunk := range meta.Chunks {
+
+			var onlineCopies []*ChunkCopy
+			for _, copyInfo := range chunk.Copies {
+				if !copyInfo.Deleted {
+					if _, ok := onlineVolumes[copyInfo.VolumeName]; ok {
+						onlineCopies = append(onlineCopies, copyInfo)
+					}
+				}
+			}
+
+			extrasToRemove := len(onlineCopies) - requiredReplicas
+
+			if extrasToRemove > 0 {
+				rand.Shuffle(len(onlineCopies), func(i, j int) {
+					onlineCopies[i], onlineCopies[j] = onlineCopies[j], onlineCopies[i]
+				})
+
+				copiesToDelete := onlineCopies[:extrasToRemove]
+
+				for _, copyToDelete := range copiesToDelete {
+					copyToDelete.Deleted = true
+
+					volumeDeletionMap[copyToDelete.VolumeName] = append(volumeDeletionMap[copyToDelete.VolumeName], map[string]interface{}{
+						"offset": copyToDelete.Offset,
+						"size":   copyToDelete.Size,
+					})
+					cleanedCount++
+					log.Printf("Nettoyage: Marqué la copie du chunk %d du fichier '%s' sur le volume '%s' pour suppression.", chunkIdx, meta.FileName, copyToDelete.VolumeName)
+				}
+			}
+		}
+	}
+
+	state.Unlock()
+
+	if cleanedCount > 0 {
+		saveIndex()
+
+		go func() {
+			for volumeName, chunks := range volumeDeletionMap {
+				if vol, ok := onlineVolumes[volumeName]; ok {
+					deleteURL := fmt.Sprintf("http://%s/mark_deleted", vol.Address)
+					deleteData := map[string]interface{}{"chunks": chunks}
+
+					jsonData, _ := json.Marshal(deleteData)
+					req, _ := http.NewRequest("POST", deleteURL, bytes.NewReader(jsonData))
+					req.Header.Set("Content-Type", "application/json")
+
+					client := &http.Client{Timeout: 5 * time.Second}
+					resp, err := client.Do(req)
+					if err != nil {
+						log.Printf("Erreur lors de la notification de suppression (nettoyage) au volume '%s': %v", volumeName, err)
+					} else {
+						resp.Body.Close()
+						log.Printf("Copies excédentaires marquées pour suppression sur le volume '%s'", volumeName)
+					}
+				}
+			}
+		}()
+		log.Printf("Nettoyage des répliques terminé. %d copies ont été marquées pour suppression.", cleanedCount)
+	} else {
+		log.Println("Nettoyage des répliques terminé. Aucune copie excédentaire n'a été trouvée.")
+	}
+}
+
+
 func runRepairProcess() {
 	type repairJob struct {
 		filename      string
@@ -1384,6 +1493,7 @@ func runRepairProcess() {
 	}
 }
 
+// MODIFIÉ: Ajout de la variable HasOverReplicatedFiles
 func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	state.RLock()
 	defer state.RUnlock()
@@ -1399,6 +1509,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 
 	files := make([]*FileMetadata, 0, len(state.FileIndex))
 	filesInDegradedState := false
+	hasOverReplicatedFiles := false // Flag pour les fichiers sur-protégés
 	isRepairPossible := false
 	deletedFilesCount := 0
 
@@ -1429,6 +1540,10 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		if f.Status == "Sur-protégé" {
+			hasOverReplicatedFiles = true
+		}
+
 		files = append(files, f)
 	}
 
@@ -1446,6 +1561,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 		Volumes                     []*Volume
 		Files                       []*FileMetadata
 		FilesInDegradedState        bool
+		HasOverReplicatedFiles      bool // Variable pour le template
 		NotEnoughDisksForRedundancy bool
 		RequiredReplicas            int
 		CanRepair                   bool
@@ -1454,6 +1570,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 		Volumes:                     volumes,
 		Files:                       files,
 		FilesInDegradedState:        filesInDegradedState,
+		HasOverReplicatedFiles:      hasOverReplicatedFiles,
 		NotEnoughDisksForRedundancy: notEnoughDisksForRedundancy,
 		RequiredReplicas:            requiredReplicas,
 		CanRepair:                   isRepairPossible,
@@ -1466,6 +1583,7 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// MODIFIÉ: Mise à jour du template HTML
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
@@ -1495,6 +1613,7 @@ const htmlTemplate = `
         .status-protected { color: #27ae60; }
         .status-degraded { color: #f39c12; }
         .status-unavailable { color: #c0392b; font-weight: bold; }
+		.status-over-protected { color: #3498db; }
         .volume-offline td { color: #95a5a6; }
         .action-buttons { display: flex; gap: 5px; }
         .confirm-delete { background-color: #c0392b; }
@@ -1524,6 +1643,21 @@ const htmlTemplate = `
 				<form action="/api/repair" method="post" style="margin:0;">
 					<button type="submit" class="btn btn-repair" {{if not .CanRepair}}disabled title="Pas assez de disques différents en ligne pour la réparation"{{end}}>
 						Effectuer une réparation
+					</button>
+				</form>
+			</div>
+        </div>
+        {{end}}
+		{{if .HasOverReplicatedFiles}}
+        <div class="alert alert-info">
+			<div>
+				<strong>Optimisation possible !</strong> Certains fichiers ont plus de copies que nécessaire ({{.RequiredReplicas}} requises).
+				<br>Vous pouvez libérer de l'espace en supprimant les copies excédentaires.
+			</div>
+			<div>
+				<form action="/api/cleanup_replicas" method="post" style="margin:0;">
+					<button type="submit" class="btn">
+						Nettoyer les copies en surplus
 					</button>
 				</form>
 			</div>
@@ -1591,6 +1725,7 @@ const htmlTemplate = `
                             <td>
                                 {{if eq .Status "Protégé"}} <span class="status-protected">✔ Protégé</span>
                                 {{else if eq .Status "Dégradé"}} <span class="status-degraded">⚠ Dégradé</span>
+								{{else if eq .Status "Sur-protégé"}} <span class="status-over-protected">ℹ️ Sur-protégé</span>
                                 {{else}} <span class="status-unavailable">✖ Indisponible</span>
                                 {{end}}
                             </td>
