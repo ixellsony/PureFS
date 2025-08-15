@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -29,10 +30,17 @@ type Config struct {
 	Address string
 }
 
+type DeletedChunk struct {
+	Offset uint64
+	Size   uint32
+}
+
 var (
-	diskConfig  Config
-	volumePath  string
-	volumeMutex = &sync.Mutex{}
+	diskConfig     Config
+	volumePath     string
+	volumeMutex    = &sync.Mutex{}
+	deletedChunks  = make(map[uint64]uint32) // offset -> size
+	deletedMutex   = &sync.RWMutex{}
 )
 
 // --- Fonctions Principales ---
@@ -64,6 +72,7 @@ func main() {
 	log.Printf("Utilisation du fichier de volume : %s", volumePath)
 
 	ensureVolumeFile()
+	loadDeletedChunks()
 
 	if err := initialRegister(); err != nil {
 		log.Fatalf("Impossible de démarrer le volume. Erreur d'enregistrement : %v", err)
@@ -73,6 +82,8 @@ func main() {
 
 	http.HandleFunc("/write_chunk", writeChunkHandler)
 	http.HandleFunc("/read_chunk", readChunkHandler)
+	http.HandleFunc("/mark_deleted", markDeletedHandler)
+	http.HandleFunc("/compact", compactHandler)
 
 	log.Printf("Volume '%s' en écoute sur http://%s", diskConfig.Name, diskConfig.Address)
 	if err := http.ListenAndServe(diskConfig.Address, nil); err != nil {
@@ -98,6 +109,58 @@ func ensureVolumeFile() {
 	}
 }
 
+func loadDeletedChunks() {
+	deletedPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.deleted", diskConfig.Name))
+	file, err := os.Open(deletedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("Aucun fichier de chunks supprimés trouvé, démarrage avec une liste vide")
+			return
+		}
+		log.Printf("Erreur lors du chargement des chunks supprimés : %v", err)
+		return
+	}
+	defer file.Close()
+
+	var chunks []DeletedChunk
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&chunks); err != nil {
+		log.Printf("Erreur lors du décodage des chunks supprimés : %v", err)
+		return
+	}
+
+	deletedMutex.Lock()
+	for _, chunk := range chunks {
+		deletedChunks[chunk.Offset] = chunk.Size
+	}
+	deletedMutex.Unlock()
+
+	log.Printf("Chargé %d chunks marqués pour suppression", len(chunks))
+}
+
+func saveDeletedChunks() {
+	deletedPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.deleted", diskConfig.Name))
+	
+	deletedMutex.RLock()
+	var chunks []DeletedChunk
+	for offset, size := range deletedChunks {
+		chunks = append(chunks, DeletedChunk{Offset: offset, Size: size})
+	}
+	deletedMutex.RUnlock()
+
+	file, err := os.Create(deletedPath)
+	if err != nil {
+		log.Printf("Erreur lors de la sauvegarde des chunks supprimés : %v", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	if err := encoder.Encode(chunks); err != nil {
+		log.Printf("Erreur lors de l'encodage des chunks supprimés : %v", err)
+	}
+}
+
 func getFreeSpaceBytes() uint64 {
 	totalBytes := uint64(volumeSizeGB) * 1024 * 1024 * 1024
 
@@ -107,10 +170,24 @@ func getFreeSpaceBytes() uint64 {
 	}
 
 	usedBytes := uint64(fileInfo.Size())
-	if usedBytes >= totalBytes {
+	
+	// Soustraire l'espace des chunks supprimés (qui sera libéré au prochain compactage)
+	deletedMutex.RLock()
+	var deletedSize uint64
+	for _, size := range deletedChunks {
+		deletedSize += uint64(size)
+	}
+	deletedMutex.RUnlock()
+
+	effectiveUsedBytes := usedBytes
+	if deletedSize < usedBytes {
+		effectiveUsedBytes = usedBytes - deletedSize
+	}
+
+	if effectiveUsedBytes >= totalBytes {
 		return 0
 	}
-	return totalBytes - usedBytes
+	return totalBytes - effectiveUsedBytes
 }
 
 func buildStatusPayload(requestType string) ([]byte, error) {
@@ -174,6 +251,121 @@ func registerWithServer() {
 			resp.Body.Close()
 		}
 	}
+}
+
+func compactVolume() error {
+	log.Printf("Début du compactage du volume '%s'", diskConfig.Name)
+	
+	deletedMutex.RLock()
+	if len(deletedChunks) == 0 {
+		deletedMutex.RUnlock()
+		log.Printf("Aucun chunk à supprimer, compactage ignoré")
+		return nil
+	}
+	
+	// Créer une liste triée des zones supprimées
+	type deletedRegion struct {
+		offset uint64
+		size   uint32
+	}
+	var deletedRegions []deletedRegion
+	for offset, size := range deletedChunks {
+		deletedRegions = append(deletedRegions, deletedRegion{offset, size})
+	}
+	deletedMutex.RUnlock()
+	
+	sort.Slice(deletedRegions, func(i, j int) bool {
+		return deletedRegions[i].offset < deletedRegions[j].offset
+	})
+	
+	volumeMutex.Lock()
+	defer volumeMutex.Unlock()
+	
+	// Créer un fichier temporaire pour le volume compacté
+	tempPath := volumePath + ".tmp"
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		return fmt.Errorf("impossible de créer le fichier temporaire : %v", err)
+	}
+	defer tempFile.Close()
+	
+	originalFile, err := os.Open(volumePath)
+	if err != nil {
+		return fmt.Errorf("impossible d'ouvrir le fichier original : %v", err)
+	}
+	defer originalFile.Close()
+	
+	var currentPos uint64 = 0
+	deletedIdx := 0
+	
+	for {
+		// Trouver la prochaine région à ignorer
+		var nextDeletedStart uint64 = ^uint64(0) // Max uint64
+		if deletedIdx < len(deletedRegions) {
+			nextDeletedStart = deletedRegions[deletedIdx].offset
+		}
+		
+		// Copier les données jusqu'à la prochaine région supprimée
+		if currentPos < nextDeletedStart {
+			copySize := nextDeletedStart - currentPos
+			
+			// Lire par blocs pour éviter de charger tout en mémoire
+			buffer := make([]byte, 1024*1024) // 1MB buffer
+			var totalCopied uint64 = 0
+			
+			for totalCopied < copySize {
+				readSize := uint64(len(buffer))
+				if totalCopied + readSize > copySize {
+					readSize = copySize - totalCopied
+				}
+				
+				n, err := originalFile.ReadAt(buffer[:readSize], int64(currentPos + totalCopied))
+				if err != nil && err != io.EOF {
+					return fmt.Errorf("erreur de lecture : %v", err)
+				}
+				if n == 0 {
+					break
+				}
+				
+				if _, err := tempFile.Write(buffer[:n]); err != nil {
+					return fmt.Errorf("erreur d'écriture : %v", err)
+				}
+				
+				totalCopied += uint64(n)
+			}
+			
+			currentPos = nextDeletedStart
+		}
+		
+		// Ignorer la région supprimée
+		if deletedIdx < len(deletedRegions) {
+			currentPos += uint64(deletedRegions[deletedIdx].size)
+			deletedIdx++
+		} else {
+			break
+		}
+	}
+	
+	// Fermer les fichiers avant le remplacement
+	originalFile.Close()
+	tempFile.Close()
+	
+	// Remplacer l'ancien fichier par le nouveau
+	if err := os.Rename(tempPath, volumePath); err != nil {
+		os.Remove(tempPath) // Nettoyer en cas d'erreur
+		return fmt.Errorf("impossible de remplacer le fichier original : %v", err)
+	}
+	
+	// Vider la liste des chunks supprimés
+	deletedMutex.Lock()
+	deletedCount := len(deletedChunks)
+	deletedChunks = make(map[uint64]uint32)
+	deletedMutex.Unlock()
+	
+	saveDeletedChunks()
+	
+	log.Printf("Compactage terminé : %d chunks supprimés, fichier optimisé", deletedCount)
+	return nil
 }
 
 // --- Handlers HTTP ---
@@ -242,6 +434,15 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Vérifier si ce chunk est marqué comme supprimé
+	deletedMutex.RLock()
+	if _, isDeleted := deletedChunks[uint64(offset)]; isDeleted {
+		deletedMutex.RUnlock()
+		http.Error(w, "Chunk supprimé", http.StatusNotFound)
+		return
+	}
+	deletedMutex.RUnlock()
+
 	volumeMutex.Lock()
 	defer volumeMutex.Unlock()
 
@@ -266,4 +467,64 @@ func readChunkHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 	w.Write(chunkData)
+}
+
+func markDeletedHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var deleteData struct {
+		Chunks []struct {
+			Offset uint64 `json:"offset"`
+			Size   uint32 `json:"size"`
+		} `json:"chunks"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&deleteData); err != nil {
+		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	deletedMutex.Lock()
+	chunksMarked := 0
+	for _, chunk := range deleteData.Chunks {
+		if _, exists := deletedChunks[chunk.Offset]; !exists {
+			deletedChunks[chunk.Offset] = chunk.Size
+			chunksMarked++
+		}
+	}
+	deletedMutex.Unlock()
+
+	if chunksMarked > 0 {
+		saveDeletedChunks()
+		log.Printf("%d chunks marqués pour suppression", chunksMarked)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"marked": chunksMarked,
+		"total":  len(deleteData.Chunks),
+	})
+}
+
+func compactHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Répondre immédiatement
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "Compactage démarré en arrière-plan",
+	})
+
+	// Lancer le compactage en arrière-plan
+	go func() {
+		if err := compactVolume(); err != nil {
+			log.Printf("Erreur lors du compactage : %v", err)
+		}
+	}()
 }
