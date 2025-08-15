@@ -22,6 +22,7 @@ const (
 
 type Config struct {
 	Name    string
+	DiskID  string // NOUVEAU: Identifiant du disque physique
 	Storage string
 	Server  string
 	Address string
@@ -36,18 +37,20 @@ var (
 // --- Fonctions Principales ---
 
 func main() {
-	name := flag.String("name", "", "Nom unique du disque (requis)")
+	name := flag.String("name", "", "Nom unique du volume (requis)")
+	diskID := flag.String("disk", "", "Identifiant du disque physique parent (requis)") // NOUVEAU
 	storage := flag.String("storage", ".", "Emplacement de stockage pour le fichier de volume")
 	server := flag.String("server", "localhost:8080", "Adresse IP:port du serveur d'index")
-	address := flag.String("address", "localhost:9000", "Adresse IP:port de ce disque pour écouter")
+	address := flag.String("address", "localhost:9000", "Adresse IP:port de ce volume pour écouter")
 	flag.Parse()
 
-	if *name == "" {
-		log.Fatal("L'argument -name est requis.")
+	if *name == "" || *diskID == "" {
+		log.Fatal("Les arguments -name et -disk sont requis.")
 	}
 
 	diskConfig = Config{
 		Name:    *name,
+		DiskID:  *diskID, // NOUVEAU
 		Storage: *storage,
 		Server:  *server,
 		Address: *address,
@@ -56,7 +59,7 @@ func main() {
 	volumeFileName := fmt.Sprintf("%s.dat", diskConfig.Name)
 	volumePath = filepath.Join(diskConfig.Storage, volumeFileName)
 
-	log.Printf("Démarrage du disque '%s' sur %s", diskConfig.Name, diskConfig.Address)
+	log.Printf("Démarrage du volume '%s' sur le disque physique '%s' (%s)", diskConfig.Name, diskConfig.DiskID, diskConfig.Address)
 	log.Printf("Utilisation du fichier de volume : %s", volumePath)
 
 	ensureVolumeFile()
@@ -70,9 +73,9 @@ func main() {
 	http.HandleFunc("/write_chunk", writeChunkHandler)
 	http.HandleFunc("/read_chunk", readChunkHandler)
 
-	log.Printf("Disque '%s' en écoute sur http://%s", diskConfig.Name, diskConfig.Address)
+	log.Printf("Volume '%s' en écoute sur http://%s", diskConfig.Name, diskConfig.Address)
 	if err := http.ListenAndServe(diskConfig.Address, nil); err != nil {
-		log.Fatalf("Le serveur du disque n'a pas pu démarrer : %v", err)
+		log.Fatalf("Le serveur du volume n'a pas pu démarrer : %v", err)
 	}
 }
 
@@ -109,17 +112,21 @@ func getFreeSpaceBytes() uint64 {
 	return totalBytes - usedBytes
 }
 
-func initialRegister() error {
-	// MODIFICATION: Ajout du champ "type" pour spécifier que c'est un enregistrement initial.
+// buildStatusPayload prépare la charge utile JSON pour le serveur.
+func buildStatusPayload(requestType string) ([]byte, error) {
 	status := map[string]interface{}{
-		"type":       "initial",
+		"type":       requestType,
 		"name":       diskConfig.Name,
+		"diskId":     diskConfig.DiskID, // NOUVEAU
 		"address":    diskConfig.Address,
 		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
 		"freeSpace":  getFreeSpaceBytes(),
 	}
+	return json.Marshal(status)
+}
 
-	payload, err := json.Marshal(status)
+func initialRegister() error {
+	payload, err := buildStatusPayload("initial")
 	if err != nil {
 		return fmt.Errorf("impossible de construire la charge utile JSON : %v", err)
 	}
@@ -149,18 +156,13 @@ func registerWithServer() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// MODIFICATION: Ajout du champ "type" pour spécifier que c'est un heartbeat.
-		status := map[string]interface{}{
-			"type":       "heartbeat",
-			"name":       diskConfig.Name,
-			"address":    diskConfig.Address,
-			"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
-			"freeSpace":  getFreeSpaceBytes(),
+		payload, err := buildStatusPayload("heartbeat")
+		if err != nil {
+			log.Printf("Erreur lors de la création du payload pour le heartbeat : %v", err)
+			continue
 		}
 
-		payload, _ := json.Marshal(status)
 		serverURL := fmt.Sprintf("http://%s/api/disk/register", diskConfig.Server)
-
 		resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
 		if err != nil {
 			log.Printf("Erreur de connexion au serveur %s : %v", diskConfig.Server, err)
@@ -168,8 +170,6 @@ func registerWithServer() {
 			if resp.StatusCode != http.StatusOK {
 				bodyBytes, _ := io.ReadAll(resp.Body)
 				log.Printf("Le serveur a répondu avec un statut non-OK lors du heartbeat : %s. Réponse : %s", resp.Status, string(bodyBytes))
-			} else {
-				log.Printf("Heartbeat envoyé au serveur avec succès.")
 			}
 			resp.Body.Close()
 		}
@@ -201,7 +201,7 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Erreur lors de l'écriture du chunk", http.StatusInternalServerError)
 		return
 	}
-	response := map[string]interface{}{"offset": offset, "size": bytesWritten}
+	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)} // Cast en uint32
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 	log.Printf("Chunk écrit avec succès (taille: %d, offset: %d)", bytesWritten, offset)
