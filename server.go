@@ -255,7 +255,6 @@ func applyOffsetMaps_unlocked(journalData *GCJournal) {
 	log.Println("Application des mises à jour d'offset terminée.")
 }
 
-
 // applyOffsetMaps est la fonction publique qui prend le verrou.
 func applyOffsetMaps(journalData *GCJournal) {
 	fileIndexMutex.Lock()
@@ -269,7 +268,8 @@ func verifyVolumeOnline(volume *Volume) bool {
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
-	testURL := fmt.Sprintf("http://%s/health", volume.Address)
+	// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+	testURL := fmt.Sprintf("http://%s/%s/health", volume.Address, volume.Name)
 
 	resp, err := client.Get(testURL)
 	if err != nil {
@@ -415,8 +415,9 @@ func calculateFileStatus(meta *FileMetadata) string {
 
 func verifyChunkExistsOnVolume(volume *Volume, copyInfo *ChunkCopy, expectedChecksum string) bool {
 	client := &http.Client{Timeout: 5 * time.Second}
-	checkURL := fmt.Sprintf("http://%s/verify_chunk?offset=%d&size=%d&checksum=%s",
-		volume.Address, copyInfo.Offset, copyInfo.Size, expectedChecksum)
+	// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+	checkURL := fmt.Sprintf("http://%s/%s/verify_chunk?offset=%d&size=%d&checksum=%s",
+		volume.Address, volume.Name, copyInfo.Offset, copyInfo.Size, expectedChecksum)
 
 	resp, err := client.Get(checkURL)
 	if err != nil {
@@ -565,23 +566,14 @@ func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool)
 	return 0, false
 }
 
-// runGarbageCollection a été entièrement réécrite pour corriger la race condition.
-// Elle verrouille l'index des fichiers pendant toute la durée des opérations critiques
-// pour éviter que de nouveaux fichiers ne soient affectés par le nettoyage.
 func runGarbageCollection() {
 	log.Println("Lancement du garbage collection...")
 
-	// --- DÉBUT DE LA CORRECTION DE LA RACE CONDITION ---
-	// On prend un VERROU EN ÉCRITURE sur l'index des fichiers.
-	// Ce verrou sera maintenu jusqu'à la fin de la fonction pour garantir qu'aucun
-	// nouvel upload ne puisse être finalisé (et donc voir ses chunks effacés par erreur)
-	// pendant que le GC est en cours.
 	fileIndexMutex.Lock()
-	defer fileIndexMutex.Unlock() // Le verrou sera relâché à la fin de la fonction.
+	defer fileIndexMutex.Unlock()
 
 	log.Println("GC: Verrou de l'index acquis. Les uploads sont mis en pause.")
 
-	// Étape 1: Nettoyer les fichiers marqués comme supprimés de l'index (sous le verrou)
 	deletedCount := 0
 	filesToDelete := make([]string, 0)
 	for filename, meta := range fileIndex {
@@ -598,8 +590,6 @@ func runGarbageCollection() {
 		log.Printf("GC: %d fichiers supprimés de l'index", deletedCount)
 	}
 
-	// Étape 2: Construire la liste des chunks à conserver pour TOUS les volumes
-	// à partir de l'état maintenant cohérent et figé de l'index.
 	type ChunkToKeep struct {
 		Offset uint64 `json:"offset"`
 		Size   uint32 `json:"size"`
@@ -615,7 +605,6 @@ func runGarbageCollection() {
 	}
 
 	for _, fileMeta := range fileIndex {
-		// Pas besoin de revérifier fileMeta.Deleted, ils ont été supprimés à l'étape 1
 		for _, chunkMeta := range fileMeta.Chunks {
 			for _, copyInfo := range chunkMeta.Copies {
 				if !copyInfo.Deleted {
@@ -633,7 +622,6 @@ func runGarbageCollection() {
 
 	log.Println("GC: Snapshot cohérent de l'index créé. Envoi des commandes de compactage...")
 
-	// Étape 3: Envoyer les commandes de compactage aux volumes de manière concurrente
 	var wg sync.WaitGroup
 	offsetMapsChan := make(chan struct {
 		VolumeName string
@@ -654,7 +642,8 @@ func runGarbageCollection() {
 				return
 			}
 
-			compactURL := fmt.Sprintf("http://%s/compact", volume.Address)
+			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+			compactURL := fmt.Sprintf("http://%s/%s/compact", volume.Address, volume.Name)
 			client := &http.Client{Timeout: 15 * time.Minute}
 
 			resp, err := client.Post(compactURL, "application/json", bytes.NewBuffer(requestBody))
@@ -689,14 +678,13 @@ func runGarbageCollection() {
 				body, _ := io.ReadAll(resp.Body)
 				log.Printf("Erreur lors du compactage de '%s': status %d, body: %s", volume.Name, resp.StatusCode, string(body))
 			}
-		}(vol, chunksToKeepByVolume[vol.Name]) // On passe la liste spécifique en paramètre
+		}(vol, chunksToKeepByVolume[vol.Name])
 	}
 	wg.Wait()
 	close(offsetMapsChan)
 
 	log.Println("GC: Tous les volumes ont terminé le compactage.")
 
-	// Étape 4: Collecter tous les résultats et préparer le journal
 	journalData := GCJournal{
 		VolumeOffsetMaps: make(map[string]map[uint64]uint64),
 	}
@@ -710,10 +698,9 @@ func runGarbageCollection() {
 
 	if !hasChanges {
 		log.Println("GC terminé. Aucun changement d'offset à appliquer.")
-		return // Le defer déverrouillera fileIndexMutex
+		return
 	}
 
-	// Étape 5: Écrire les changements dans un journal AVANT de modifier l'état en mémoire
 	log.Println("GC: Écriture du journal de transaction...")
 	journalFile, err := os.Create(gcJournalPath)
 	if err != nil {
@@ -729,21 +716,15 @@ func runGarbageCollection() {
 	}
 	journalFile.Close()
 
-	// Étape 6: Appliquer les changements à l'index en mémoire (toujours sous verrou)
 	applyOffsetMaps_unlocked(&journalData)
-
-	// Étape 7: Sauvegarder l'index principal mis à jour (toujours sous verrou)
 	saveIndex_unlocked()
 
-	// Étape 8: Supprimer le journal, l'opération est terminée
 	if err := os.Remove(gcJournalPath); err != nil {
 		log.Printf("AVERTISSEMENT: Impossible de supprimer le journal de GC après succès: %v", err)
 	}
 
 	log.Println("Garbage collection terminé et index mis à jour de manière transactionnelle et sécurisée.")
-	// Le defer fileIndexMutex.Unlock() s'exécute ici, libérant les uploads en attente.
 }
-
 
 // --- Handlers HTTP ---
 
@@ -884,7 +865,8 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 
-				diskURL := fmt.Sprintf("http://%s/write_chunk", v.Address)
+				// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+				diskURL := fmt.Sprintf("http://%s/%s/write_chunk", v.Address, v.Name)
 				req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(buffer))
 				req.Header.Set("Content-Type", "application/octet-stream")
 				req.Header.Set("X-Chunk-Checksum", checksum)
@@ -990,7 +972,6 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		UploadDate: time.Now(),
 		Chunks:     fileChunks,
 	}
-    // L'ajout à l'index est la section critique. Il attendra si un GC est en cours.
 	fileIndexMutex.Lock()
 	fileIndex[fileName] = tempMeta
 	fileIndexMutex.Unlock()
@@ -1053,7 +1034,8 @@ func cleanupUploadChunks(chunkIdentifiers []string) {
 				continue
 			}
 
-			cleanupURL := fmt.Sprintf("http://%s/cleanup_orphan", vol.Address)
+			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+			cleanupURL := fmt.Sprintf("http://%s/%s/cleanup_orphan", vol.Address, vol.Name)
 			cleanupData := map[string]interface{}{
 				"chunks": chunks,
 			}
@@ -1111,7 +1093,6 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// Créer une copie des métadonnées pour travailler en dehors du verrou
 	metaCopy := &FileMetadata{
 		TotalSize: meta.TotalSize,
 		Chunks:    make([]*ChunkMetadata, len(meta.Chunks)),
@@ -1147,7 +1128,8 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			diskURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", volume.Address, copyInfo.Offset, copyInfo.Size)
+			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+			diskURL := fmt.Sprintf("http://%s/%s/read_chunk?offset=%d&size=%d", volume.Address, volume.Name, copyInfo.Offset, copyInfo.Size)
 
 			client := &http.Client{Timeout: 10 * time.Second}
 			resp, err := client.Get(diskURL)
@@ -1232,10 +1214,9 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 			}{copy.VolumeName, copy.Offset, copy.Size})
 		}
 	}
-	
-	// Utilisation de la version _unlocked car nous détenons déjà le verrou
+
 	saveIndex_unlocked()
-	
+
 	go func() {
 		log.Printf("Fichier '%s' marqué pour suppression", filename)
 
@@ -1259,7 +1240,8 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 
 		for volumeName, chunks := range volumeChunks {
 			if vol, ok := volumes[volumeName]; ok {
-				deleteURL := fmt.Sprintf("http://%s/mark_deleted", vol.Address)
+				// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+				deleteURL := fmt.Sprintf("http://%s/%s/mark_deleted", vol.Address, vol.Name)
 				deleteData := map[string]interface{}{
 					"chunks": chunks,
 				}
@@ -1354,7 +1336,7 @@ func runCleanupReplicasProcess() {
 			}
 		}
 	}
-	
+
 	if cleanedCount > 0 {
 		saveIndex_unlocked()
 	}
@@ -1362,17 +1344,16 @@ func runCleanupReplicasProcess() {
 	fileIndexMutex.Unlock()
 	volumeMutex.Unlock()
 
-
 	if cleanedCount > 0 {
 		go func() {
 			for volumeName, chunks := range volumeDeletionMap {
-				// Re-vérifier l'état en ligne au moment de l'envoi
 				volumeMutex.RLock()
 				vol, ok := registeredVolumes[volumeName]
 				volumeMutex.RUnlock()
 
 				if ok && vol.Status == "En ligne" {
-					deleteURL := fmt.Sprintf("http://%s/mark_deleted", vol.Address)
+					// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+					deleteURL := fmt.Sprintf("http://%s/%s/mark_deleted", vol.Address, vol.Name)
 					deleteData := map[string]interface{}{"chunks": chunks}
 
 					jsonData, _ := json.Marshal(deleteData)
@@ -1469,7 +1450,8 @@ func runRepairProcess() {
 		}
 		targetVolume := targetVolumes[0]
 
-		readURL := fmt.Sprintf("http://%s/read_chunk?offset=%d&size=%d", job.sourceVolume.Address, job.sourceCopy.Offset, job.sourceCopy.Size)
+		// MODIFIÉ : L'URL de lecture inclut maintenant le nom du volume dans le chemin.
+		readURL := fmt.Sprintf("http://%s/%s/read_chunk?offset=%d&size=%d", job.sourceVolume.Address, job.sourceVolume.Name, job.sourceCopy.Offset, job.sourceCopy.Size)
 		resp, err := http.Get(readURL)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			log.Printf("ERREUR REPARATION: Impossible de lire le chunk source depuis '%s': %v", job.sourceVolume.Name, err)
@@ -1493,7 +1475,8 @@ func runRepairProcess() {
 			continue
 		}
 
-		writeURL := fmt.Sprintf("http://%s/write_chunk", targetVolume.Address)
+		// MODIFIÉ : L'URL d'écriture inclut maintenant le nom du volume dans le chemin.
+		writeURL := fmt.Sprintf("http://%s/%s/write_chunk", targetVolume.Address, targetVolume.Name)
 		req, _ := http.NewRequest("POST", writeURL, bytes.NewReader(chunkData))
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("X-Chunk-Checksum", job.chunkChecksum)
