@@ -121,4 +121,5 @@ Utilisé par un agent de disque pour s'enregistrer ou envoyer un heartbeat au se
       -disks="/mnt/stockage1,/mnt/stockage2" \
       -server="<IP_DU_SERVEUR>:8080" \
       -listen-addr="0.0.0.0:9000"
-    ```    L'agent va scanner les disques, créer les fichiers volumes (`.dat`) et s'enregistrer auprès du serveur. Les volumes apparaîtront alors dans l'interface web.
+    ```
+    L'agent va scanner les disques, créer les fichiers volumes (`.dat`) et s'enregistrer auprès du serveur. Les volumes apparaîtront alors dans l'interface web.
