@@ -1,11 +1,12 @@
-package main
+// --- volume/volume.go ---
+
+package volume
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -18,17 +19,17 @@ import (
 	"time"
 )
 
-// --- Constantes et Configuration ---
 const (
 	volumeSizeGB = 30
 )
 
+// Config contient tous les paramètres nécessaires pour créer une instance de Volume.
 type Config struct {
-	Name    string
-	DiskID  string
-	Storage string
-	Server  string
-	Address string
+	Name       string
+	DiskID     string
+	StorageDir string // Répertoire où le .dat et les métadonnées seront stockés
+	ServerAddr string // Adresse du serveur principal (ex: "localhost:8080")
+	ListenAddr string // Adresse de l'AGENT qui écoute (ex: "0.0.0.0:9000")
 }
 
 type DeletedChunk struct {
@@ -43,119 +44,98 @@ type OrphanChunk struct {
 	Created  time.Time
 }
 
-// Structure pour un chunk à conserver, utilisée dans les instructions de compactage
 type ChunkToKeep struct {
 	Offset uint64 `json:"offset"`
 	Size   uint32 `json:"size"`
 }
 
-// Structure pour les instructions de compactage reçues du serveur
 type CompactionInstruction struct {
 	ChunksToKeep []ChunkToKeep `json:"chunks_to_keep"`
 }
 
-var (
-	diskConfig    Config
+// Volume encapsule l'état et la logique d'un seul volume de 30 Go.
+type Volume struct {
+	config        Config
 	volumePath    string
-	volumeFile    *os.File // NOUVEAU : Descripteur de fichier global pour le volume .dat
-	volumeMutex   = &sync.Mutex{}
-	deletedChunks = make(map[uint64]uint32) // offset -> size
-	deletedMutex  = &sync.RWMutex{}
-	orphanChunks  = make(map[string]OrphanChunk) // checksum -> chunk info
-	orphanMutex   = &sync.RWMutex{}
-)
+	volumeFile    *os.File
+	volumeMutex   *sync.Mutex
+	deletedChunks map[uint64]uint32
+	deletedMutex  *sync.RWMutex
+	orphanChunks  map[string]OrphanChunk
+	orphanMutex   *sync.RWMutex
+}
 
-// --- Fonctions Principales ---
-
-func main() {
-	name := flag.String("name", "", "Nom unique du volume (requis)")
-	diskID := flag.String("disk", "", "Identifiant du disque physique parent (requis)")
-	storage := flag.String("storage", ".", "Emplacement de stockage pour le fichier de volume")
-	server := flag.String("server", "localhost:8080", "Adresse IP:port du serveur d'index")
-	address := flag.String("address", "localhost:9000", "Adresse IP:port de ce volume pour écouter")
-	flag.Parse()
-
-	if *name == "" || *diskID == "" {
-		log.Fatal("Les arguments -name et -disk sont requis.")
+// New crée et initialise une nouvelle instance de Volume.
+func New(cfg Config) (*Volume, error) {
+	v := &Volume{
+		config:        cfg,
+		volumeMutex:   &sync.Mutex{},
+		deletedChunks: make(map[uint64]uint32),
+		deletedMutex:  &sync.RWMutex{},
+		orphanChunks:  make(map[string]OrphanChunk),
+		orphanMutex:   &sync.RWMutex{},
 	}
 
-	diskConfig = Config{
-		Name:    *name,
-		DiskID:  *diskID,
-		Storage: *storage,
-		Server:  *server,
-		Address: *address,
+	volumeFileName := fmt.Sprintf("%s.dat", v.config.Name)
+	v.volumePath = filepath.Join(v.config.StorageDir, volumeFileName)
+
+	log.Printf("Initialisation du volume '%s' sur le disque '%s'", v.config.Name, v.config.DiskID)
+
+	if err := v.ensureVolumeFile(); err != nil {
+		return nil, fmt.Errorf("erreur lors de la création du fichier pour le volume %s: %w", v.config.Name, err)
 	}
 
-	volumeFileName := fmt.Sprintf("%s.dat", diskConfig.Name)
-	volumePath = filepath.Join(diskConfig.Storage, volumeFileName)
-
-	log.Printf("Démarrage du volume '%s' sur le disque physique '%s' (%s)", diskConfig.Name, diskConfig.DiskID, diskConfig.Address)
-	log.Printf("Utilisation du fichier de volume : %s", volumePath)
-
-	ensureVolumeFile()
-
-	// MODIFIÉ : Ouvre le fichier de volume une seule fois au démarrage.
 	var err error
-	volumeFile, err = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
+	v.volumeFile, err = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		log.Fatalf("Impossible d'ouvrir le fichier de volume '%s': %v", volumePath, err)
-	}
-	// S'assure que le fichier est bien fermé à l'arrêt du programme.
-	defer volumeFile.Close()
-
-	loadDeletedChunks()
-	loadOrphanChunks()
-
-	go cleanupOldOrphans()
-
-	if err := initialRegister(); err != nil {
-		log.Fatalf("Impossible de démarrer le volume. Erreur d'enregistrement : %v", err)
+		return nil, fmt.Errorf("impossible d'ouvrir le fichier de volume '%s': %w", v.config.Name, err)
 	}
 
-	go registerWithServer()
+	v.loadDeletedChunks()
+	v.loadOrphanChunks()
 
-	http.HandleFunc("/write_chunk", writeChunkHandler)
-	http.HandleFunc("/read_chunk", readChunkHandler)
-	http.HandleFunc("/verify_chunk", verifyChunkHandler)
-	http.HandleFunc("/mark_deleted", markDeletedHandler)
-	http.HandleFunc("/compact", compactHandler)
-	http.HandleFunc("/cleanup_orphan", cleanupOrphanHandler)
-	http.HandleFunc("/health", healthCheckHandler)
-
-	log.Printf("Volume '%s' en écoute sur http://%s", diskConfig.Name, diskConfig.Address)
-	if err := http.ListenAndServe(diskConfig.Address, nil); err != nil {
-		log.Fatalf("Le serveur du volume n'a pas pu démarrer : %v", err)
-	}
+	return v, nil
 }
 
-// --- Logique Métier ---
+// Start lance les tâches de fond du volume (heartbeats). C'est une méthode non-bloquante.
+func (v *Volume) Start() error {
+	log.Printf("Démarrage de la logique du volume '%s'...", v.config.Name)
 
-func ensureVolumeFile() {
-	if err := os.MkdirAll(diskConfig.Storage, 0755); err != nil {
-		log.Fatalf("Impossible de créer le répertoire de stockage : %v", err)
+	if err := v.initialRegister(); err != nil {
+		v.volumeFile.Close() // Nettoyage en cas d'échec
+		return fmt.Errorf("impossible de démarrer le volume '%s'. Erreur d'enregistrement : %w", v.config.Name, err)
 	}
-	if _, err := os.Stat(volumePath); os.IsNotExist(err) {
-		log.Printf("Création du fichier de volume : %s", volumePath)
-		file, err := os.Create(volumePath)
+
+	go v.cleanupOldOrphans()
+	go v.registerWithServer() // Tâche de fond pour les heartbeats
+
+	log.Printf("Volume '%s' est prêt et envoie des heartbeats.", v.config.Name)
+	return nil
+}
+
+// --- Logique Métier (interne au volume) ---
+
+func (v *Volume) ensureVolumeFile() error {
+	if _, err := os.Stat(v.volumePath); os.IsNotExist(err) {
+		log.Printf("Création du fichier de volume : %s", v.volumePath)
+		file, err := os.Create(v.volumePath)
 		if err != nil {
-			log.Fatalf("Impossible de créer le fichier de volume : %v", err)
+			return fmt.Errorf("impossible de créer le fichier de volume : %w", err)
 		}
-		file.Close() // Fermer immédiatement après la création.
-	} else {
-		log.Printf("Fichier de volume existant trouvé : %s", volumePath)
+		return file.Close()
 	}
+	log.Printf("Fichier de volume existant trouvé : %s", v.volumePath)
+	return nil
 }
 
-func loadDeletedChunks() {
-	deletedPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.deleted", diskConfig.Name))
+func (v *Volume) loadDeletedChunks() {
+	deletedPath := filepath.Join(v.config.StorageDir, fmt.Sprintf("%s.deleted", v.config.Name))
 	file, err := os.Open(deletedPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Aucun fichier de chunks supprimés trouvé, démarrage avec une liste vide")
 			return
 		}
-		log.Printf("Erreur lors du chargement des chunks supprimés : %v", err)
+		log.Printf("Erreur lors du chargement des chunks supprimés pour le volume %s : %v", v.config.Name, err)
 		return
 	}
 	defer file.Close()
@@ -163,28 +143,25 @@ func loadDeletedChunks() {
 	var chunks []DeletedChunk
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&chunks); err != nil {
-		log.Printf("Erreur lors du décodage des chunks supprimés : %v", err)
+		log.Printf("Erreur lors du décodage des chunks supprimés pour le volume %s : %v", v.config.Name, err)
 		return
 	}
 
-	deletedMutex.Lock()
+	v.deletedMutex.Lock()
 	for _, chunk := range chunks {
-		deletedChunks[chunk.Offset] = chunk.Size
+		v.deletedChunks[chunk.Offset] = chunk.Size
 	}
-	deletedMutex.Unlock()
-
-	log.Printf("Chargé %d chunks marqués pour suppression", len(chunks))
+	v.deletedMutex.Unlock()
 }
 
-func loadOrphanChunks() {
-	orphanPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.orphans", diskConfig.Name))
+func (v *Volume) loadOrphanChunks() {
+	orphanPath := filepath.Join(v.config.StorageDir, fmt.Sprintf("%s.orphans", v.config.Name))
 	file, err := os.Open(orphanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("Aucun fichier de chunks orphelins trouvé")
 			return
 		}
-		log.Printf("Erreur lors du chargement des chunks orphelins : %v", err)
+		log.Printf("Erreur lors du chargement des chunks orphelins pour le volume %s : %v", v.config.Name, err)
 		return
 	}
 	defer file.Close()
@@ -192,33 +169,31 @@ func loadOrphanChunks() {
 	var orphans []OrphanChunk
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&orphans); err != nil {
-		log.Printf("Erreur lors du décodage des chunks orphelins : %v", err)
+		log.Printf("Erreur lors du décodage des chunks orphelins pour le volume %s: %v", v.config.Name, err)
 		return
 	}
 
-	orphanMutex.Lock()
+	v.orphanMutex.Lock()
 	for _, orphan := range orphans {
-		orphanChunks[orphan.Checksum] = orphan
+		v.orphanChunks[orphan.Checksum] = orphan
 	}
-	orphanMutex.Unlock()
-
-	log.Printf("Chargé %d chunks orphelins", len(orphans))
+	v.orphanMutex.Unlock()
 }
 
-func saveDeletedChunks() {
-	deletedPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.deleted", diskConfig.Name))
+func (v *Volume) saveDeletedChunks() {
+	deletedPath := filepath.Join(v.config.StorageDir, fmt.Sprintf("%s.deleted", v.config.Name))
 
-	deletedMutex.RLock()
+	v.deletedMutex.RLock()
 	var chunks []DeletedChunk
-	for offset, size := range deletedChunks {
+	for offset, size := range v.deletedChunks {
 		chunks = append(chunks, DeletedChunk{Offset: offset, Size: size})
 	}
-	deletedMutex.RUnlock()
+	v.deletedMutex.RUnlock()
 
 	tempPath := deletedPath + ".tmp"
 	file, err := os.Create(tempPath)
 	if err != nil {
-		log.Printf("Erreur lors de la création du fichier temporaire pour les chunks supprimés : %v", err)
+		log.Printf("Erreur (vol %s): création fichier temp pour chunks supprimés: %v", v.config.Name, err)
 		return
 	}
 
@@ -227,32 +202,31 @@ func saveDeletedChunks() {
 	file.Close()
 
 	if err != nil {
-		log.Printf("Erreur lors de l'encodage des chunks supprimés : %v", err)
+		log.Printf("Erreur (vol %s): encodage chunks supprimés: %v", v.config.Name, err)
 		os.Remove(tempPath)
 		return
 	}
 
 	if err := os.Rename(tempPath, deletedPath); err != nil {
-		log.Printf("Erreur lors de la finalisation de la sauvegarde des chunks supprimés : %v", err)
+		log.Printf("Erreur (vol %s): finalisation sauvegarde chunks supprimés: %v", v.config.Name, err)
 		os.Remove(tempPath)
-		return
 	}
 }
 
-func saveOrphanChunks() {
-	orphanPath := filepath.Join(diskConfig.Storage, fmt.Sprintf("%s.orphans", diskConfig.Name))
+func (v *Volume) saveOrphanChunks() {
+	orphanPath := filepath.Join(v.config.StorageDir, fmt.Sprintf("%s.orphans", v.config.Name))
 
-	orphanMutex.RLock()
+	v.orphanMutex.RLock()
 	var orphans []OrphanChunk
-	for _, orphan := range orphanChunks {
+	for _, orphan := range v.orphanChunks {
 		orphans = append(orphans, orphan)
 	}
-	orphanMutex.RUnlock()
+	v.orphanMutex.RUnlock()
 
 	tempPath := orphanPath + ".tmp"
 	file, err := os.Create(tempPath)
 	if err != nil {
-		log.Printf("Erreur lors de la création du fichier temporaire pour les chunks orphelins : %v", err)
+		log.Printf("Erreur (vol %s): création fichier temp pour chunks orphelins: %v", v.config.Name, err)
 		return
 	}
 
@@ -261,67 +235,57 @@ func saveOrphanChunks() {
 	file.Close()
 
 	if err != nil {
-		log.Printf("Erreur lors de l'encodage des chunks orphelins : %v", err)
+		log.Printf("Erreur (vol %s): encodage chunks orphelins: %v", v.config.Name, err)
 		os.Remove(tempPath)
 		return
 	}
 
 	if err := os.Rename(tempPath, orphanPath); err != nil {
-		log.Printf("Erreur lors de la finalisation de la sauvegarde des chunks orphelins : %v", err)
+		log.Printf("Erreur (vol %s): finalisation sauvegarde chunks orphelins: %v", v.config.Name, err)
 		os.Remove(tempPath)
-		return
 	}
 }
 
-func cleanupOldOrphans() {
+func (v *Volume) cleanupOldOrphans() {
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		orphanMutex.Lock()
+		v.orphanMutex.Lock()
 		cutoff := time.Now().Add(-24 * time.Hour)
 		cleaned := 0
 
-		for checksum, orphan := range orphanChunks {
+		for checksum, orphan := range v.orphanChunks {
 			if orphan.Created.Before(cutoff) {
-				delete(orphanChunks, checksum)
+				delete(v.orphanChunks, checksum)
 				cleaned++
-				log.Printf("Chunk orphelin ancien supprimé après 24h : %s", checksum[:8])
 			}
 		}
-		orphanMutex.Unlock()
+		v.orphanMutex.Unlock()
 
 		if cleaned > 0 {
-			saveOrphanChunks()
-			log.Printf("Nettoyage automatique : %d chunks orphelins anciens (>24h) supprimés", cleaned)
+			v.saveOrphanChunks()
+			log.Printf("Nettoyage (vol %s): %d chunks orphelins anciens (>24h) supprimés", v.config.Name, cleaned)
 		}
 	}
 }
 
-func checkSpaceAvailable(requiredBytes uint64) error {
-	freeSpace := getFreeSpaceBytes()
-	if freeSpace < requiredBytes {
-		return fmt.Errorf("espace insuffisant : %d bytes requis, %d bytes disponibles", requiredBytes, freeSpace)
-	}
-	return nil
-}
-
-func getFreeSpaceBytes() uint64 {
+func (v *Volume) getFreeSpaceBytes() uint64 {
 	totalBytes := uint64(volumeSizeGB) * 1024 * 1024 * 1024
 
-	fileInfo, err := os.Stat(volumePath)
+	fileInfo, err := v.volumeFile.Stat()
 	if err != nil {
-		return totalBytes
+		return totalBytes // Si le fichier n'a pas de taille, on considère tout l'espace comme libre
 	}
 
 	usedBytes := uint64(fileInfo.Size())
 
-	deletedMutex.RLock()
+	v.deletedMutex.RLock()
 	var deletedSize uint64
-	for _, size := range deletedChunks {
+	for _, size := range v.deletedChunks {
 		deletedSize += uint64(size)
 	}
-	deletedMutex.RUnlock()
+	v.deletedMutex.RUnlock()
 
 	effectiveUsedBytes := usedBytes
 	if deletedSize < usedBytes {
@@ -334,33 +298,33 @@ func getFreeSpaceBytes() uint64 {
 	return totalBytes - effectiveUsedBytes
 }
 
-func buildStatusPayload(requestType string) ([]byte, error) {
+func (v *Volume) buildStatusPayload(requestType string) ([]byte, error) {
 	status := map[string]interface{}{
 		"type":       requestType,
-		"name":       diskConfig.Name,
-		"diskId":     diskConfig.DiskID,
-		"address":    diskConfig.Address,
+		"name":       v.config.Name,
+		"diskId":     v.config.DiskID,
+		"address":    v.config.ListenAddr, // Utilise l'adresse de l'agent
 		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
-		"freeSpace":  getFreeSpaceBytes(),
+		"freeSpace":  v.getFreeSpaceBytes(),
 	}
 	return json.Marshal(status)
 }
 
-func initialRegister() error {
-	payload, err := buildStatusPayload("initial")
+func (v *Volume) initialRegister() error {
+	payload, err := v.buildStatusPayload("initial")
 	if err != nil {
-		return fmt.Errorf("impossible de construire la charge utile JSON : %v", err)
+		return fmt.Errorf("impossible de construire la charge utile JSON : %w", err)
 	}
 
-	serverURL := fmt.Sprintf("http://%s/api/disk/register", diskConfig.Server)
+	serverURL := fmt.Sprintf("http://%s/api/disk/register", v.config.ServerAddr)
 	resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
-		return fmt.Errorf("erreur de connexion au serveur %s : %v", diskConfig.Server, err)
+		return fmt.Errorf("erreur de connexion au serveur %s : %w", v.config.ServerAddr, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
-		log.Println("Enregistrement initial auprès du serveur réussi.")
+		log.Printf("Enregistrement initial du volume '%s' réussi.", v.config.Name)
 		return nil
 	}
 
@@ -372,198 +336,34 @@ func initialRegister() error {
 	return fmt.Errorf("le serveur a répondu avec un statut inattendu %s. Réponse : %s", resp.Status, string(bodyBytes))
 }
 
-func registerWithServer() {
+func (v *Volume) registerWithServer() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		payload, err := buildStatusPayload("heartbeat")
+		payload, err := v.buildStatusPayload("heartbeat")
 		if err != nil {
-			log.Printf("Erreur lors de la création du payload pour le heartbeat : %v", err)
+			log.Printf("Erreur (vol %s): création du payload heartbeat : %v", v.config.Name, err)
 			continue
 		}
 
-		serverURL := fmt.Sprintf("http://%s/api/disk/register", diskConfig.Server)
+		serverURL := fmt.Sprintf("http://%s/api/disk/register", v.config.ServerAddr)
 		resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
 		if err != nil {
-			log.Printf("Erreur de connexion au serveur %s : %v", diskConfig.Server, err)
+			log.Printf("Erreur (vol %s): connexion au serveur %s : %v", v.config.Name, v.config.ServerAddr, err)
 		} else {
 			if resp.StatusCode != http.StatusOK {
 				bodyBytes, _ := io.ReadAll(resp.Body)
-				log.Printf("Le serveur a répondu avec un statut non-OK lors du heartbeat : %s. Réponse : %s", resp.Status, string(bodyBytes))
+				log.Printf("Le serveur a répondu non-OK au heartbeat du vol %s: %s. Réponse : %s", v.config.Name, resp.Status, string(bodyBytes))
 			}
 			resp.Body.Close()
 		}
 	}
 }
 
-// La fonction de compactage est maintenant pilotée par les instructions du serveur.
-func compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
-	log.Printf("Début du compactage instruit par le serveur pour le volume '%s'", diskConfig.Name)
+// --- Handlers (maintenant des méthodes publiques appelées par l'agent) ---
 
-	if len(chunksToKeep) == 0 {
-		log.Printf("Instruction de compactage reçue, mais aucun chunk à conserver. Le volume sera vidé.")
-	}
-
-	sort.Slice(chunksToKeep, func(i, j int) bool {
-		return chunksToKeep[i].Offset < chunksToKeep[j].Offset
-	})
-
-	volumeMutex.Lock()
-	defer volumeMutex.Unlock()
-
-	// MODIFIÉ : Fermer le descripteur de fichier global avant de remplacer le fichier.
-	if err := volumeFile.Close(); err != nil {
-		log.Printf("AVERTISSEMENT: Impossible de fermer le descripteur de fichier du volume avant le compactage : %v", err)
-		// Essayer de le rouvrir pour maintenir la cohérence de l'état.
-		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("impossible de fermer le descripteur de fichier existant: %w", err)
-	}
-
-	originalFile, err := os.Open(volumePath)
-	if err != nil {
-		// Essayer de rouvrir le descripteur principal avant de retourner l'erreur.
-		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("impossible d'ouvrir le fichier original: %w", err)
-	}
-
-	tempPath := volumePath + ".tmp"
-	tempFile, err := os.Create(tempPath)
-	if err != nil {
-		originalFile.Close()
-		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("impossible de créer le fichier temporaire: %w", err)
-	}
-
-	offsetMapping := make(map[uint64]uint64)
-	var currentWriteOffset uint64 = 0
-
-	for _, chunk := range chunksToKeep {
-		offsetMapping[chunk.Offset] = currentWriteOffset
-		bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size)), int64(chunk.Size))
-		if err != nil {
-			tempFile.Close()
-			originalFile.Close()
-			os.Remove(tempPath)
-			volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-			return nil, fmt.Errorf("erreur de copie du chunk (offset: %d, size: %d): %w", chunk.Offset, chunk.Size, err)
-		}
-		currentWriteOffset += uint64(bytesCopied)
-	}
-
-	originalFile.Close()
-	if err := tempFile.Close(); err != nil {
-		os.Remove(tempPath)
-		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("erreur lors de la fermeture du fichier temporaire: %w", err)
-	}
-
-	if err := os.Rename(tempPath, volumePath); err != nil {
-		os.Remove(tempPath)
-		volumeFile, _ = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("impossible de remplacer le fichier original: %w", err)
-	}
-
-	// MODIFIÉ : Rouvrir le descripteur de fichier global pour qu'il pointe vers le nouveau fichier compacté.
-	volumeFile, err = os.OpenFile(volumePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		// C'est un état critique. Le volume n'est plus fonctionnel.
-		log.Fatalf("ERREUR CRITIQUE : Le fichier de volume a été remplacé mais impossible de le rouvrir : %v", err)
-	}
-
-	deletedMutex.Lock()
-	deletedCount := len(deletedChunks)
-	deletedChunks = make(map[uint64]uint32)
-	deletedMutex.Unlock()
-	saveDeletedChunks()
-
-	log.Printf("Compactage instruit terminé : %d chunks conservés, %d anciens enregistrements de suppression purgés. %d mappings d'offset créés.", len(chunksToKeep), deletedCount, len(offsetMapping))
-	return offsetMapping, nil
-}
-
-// --- Handlers HTTP ---
-
-func verifyChunkHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
-	offsetStr := r.URL.Query().Get("offset")
-	sizeStr := r.URL.Query().Get("size")
-	expectedChecksum := r.URL.Query().Get("checksum")
-
-	if offsetStr == "" || sizeStr == "" || expectedChecksum == "" {
-		http.Error(w, "Paramètres 'offset', 'size' et 'checksum' requis", http.StatusBadRequest)
-		return
-	}
-
-	offset, err := strconv.ParseUint(offsetStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Paramètre 'offset' invalide", http.StatusBadRequest)
-		return
-	}
-
-	size, err := strconv.ParseUint(sizeStr, 10, 32)
-	if err != nil {
-		http.Error(w, "Paramètre 'size' invalide", http.StatusBadRequest)
-		return
-	}
-
-	deletedMutex.RLock()
-	if _, isDeleted := deletedChunks[offset]; isDeleted {
-		deletedMutex.RUnlock()
-		http.Error(w, "Chunk marqué comme supprimé", http.StatusNotFound)
-		return
-	}
-	deletedMutex.RUnlock()
-
-	volumeMutex.Lock()
-	defer volumeMutex.Unlock()
-
-	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir le fichier.
-	fileInfo, err := volumeFile.Stat()
-	if err != nil {
-		http.Error(w, "Erreur de lecture des métadonnées du volume", http.StatusInternalServerError)
-		return
-	}
-
-	if int64(offset+uint64(size)) > fileInfo.Size() {
-		http.Error(w, "Chunk au-delà de la fin du volume", http.StatusNotFound)
-		return
-	}
-
-	// MODIFIÉ : Lecture depuis le descripteur de fichier global.
-	chunkData := make([]byte, size)
-	_, err = volumeFile.ReadAt(chunkData, int64(offset))
-	if err != nil {
-		http.Error(w, "Erreur de lecture du chunk", http.StatusInternalServerError)
-		return
-	}
-
-	hash := sha256.Sum256(chunkData)
-	actualChecksum := hex.EncodeToString(hash[:])
-
-	if actualChecksum != expectedChecksum {
-		log.Printf("ERREUR VERIFICATION: Chunk corrompu détecté - offset:%d, size:%d, attendu:%s, réel:%s",
-			offset, size, expectedChecksum, actualChecksum)
-		http.Error(w, "Chunk corrompu", http.StatusConflict)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	response := map[string]interface{}{
-		"status":   "ok",
-		"checksum": actualChecksum,
-		"size":     size,
-		"offset":   offset,
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
+func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
 		return
@@ -581,8 +381,8 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := checkSpaceAvailable(uint64(len(chunkData)) + 10*1024*1024); err != nil {
-		log.Printf("ERREUR ESPACE: %v", err)
+	if v.getFreeSpaceBytes() < uint64(len(chunkData)) {
+		log.Printf("ERREUR ESPACE (vol %s): Espace insuffisant", v.config.Name)
 		http.Error(w, "Espace disque insuffisant", http.StatusInsufficientStorage)
 		return
 	}
@@ -591,354 +391,105 @@ func writeChunkHandler(w http.ResponseWriter, r *http.Request) {
 	actualChecksum := hex.EncodeToString(hash[:])
 
 	if actualChecksum != expectedChecksum {
-		log.Printf("ERREUR: Checksum invalide pour l'écriture. Attendu: %s, Reçu: %s", expectedChecksum, actualChecksum)
-		http.Error(w, "Checksum invalide. Les données ont pu être corrompues pendant le transfert.", http.StatusBadRequest)
+		http.Error(w, "Checksum invalide.", http.StatusBadRequest)
 		return
 	}
 
-	volumeMutex.Lock()
-	defer volumeMutex.Unlock()
+	v.volumeMutex.Lock()
+	defer v.volumeMutex.Unlock()
 
-	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir/fermer le fichier.
-	// On se positionne à la fin pour simuler un 'append'.
-	offset, err := volumeFile.Seek(0, io.SeekEnd)
+	offset, err := v.volumeFile.Seek(0, io.SeekEnd)
 	if err != nil {
-		log.Printf("ERREUR CRITIQUE: Impossible de se positionner à la fin du volume: %v", err)
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 
-	bytesWritten, err := volumeFile.Write(chunkData)
+	bytesWritten, err := v.volumeFile.Write(chunkData)
 	if err != nil {
-		log.Printf("ERREUR CRITIQUE: Échec d'écriture sur le volume à l'offset %d: %v", offset, err)
-		orphanMutex.Lock()
-		orphanChunks[actualChecksum] = OrphanChunk{
-			Checksum: actualChecksum,
-			Offset:   uint64(offset),
-			Size:     uint32(len(chunkData)),
-			Created:  time.Now(),
+		v.orphanMutex.Lock()
+		v.orphanChunks[actualChecksum] = OrphanChunk{
+			Checksum: actualChecksum, Offset: uint64(offset), Size: uint32(len(chunkData)), Created: time.Now(),
 		}
-		orphanMutex.Unlock()
-		saveOrphanChunks()
+		v.orphanMutex.Unlock()
+		v.saveOrphanChunks()
 		http.Error(w, "Erreur lors de l'écriture du chunk", http.StatusInternalServerError)
 		return
 	}
 
-	if bytesWritten != len(chunkData) {
-		log.Printf("ERREUR CRITIQUE: Écriture incomplète - attendu: %d bytes, écrit: %d bytes",
-			len(chunkData), bytesWritten)
-		orphanMutex.Lock()
-		orphanChunks[actualChecksum] = OrphanChunk{
-			Checksum: actualChecksum,
-			Offset:   uint64(offset),
-			Size:     uint32(bytesWritten),
-			Created:  time.Now(),
-		}
-		orphanMutex.Unlock()
-		saveOrphanChunks()
-		http.Error(w, "Écriture incomplète du chunk", http.StatusInternalServerError)
-		return
-	}
-
-	// Forcer l'écriture sur le disque physique.
-	if err := volumeFile.Sync(); err != nil {
-		log.Printf("ERREUR CRITIQUE: Impossible de synchroniser les données sur disque: %v", err)
-	}
-
-	// MODIFIÉ : Vérification en re-lisant depuis le même descripteur de fichier.
-	verifyData := make([]byte, bytesWritten)
-	_, err = volumeFile.ReadAt(verifyData, offset)
-	if err != nil {
-		log.Printf("ERREUR VERIFICATION: Impossible de relire le chunk écrit: %v", err)
-	} else {
-		verifyHash := sha256.Sum256(verifyData)
-		verifyChecksum := hex.EncodeToString(verifyHash[:])
-
-		if verifyChecksum != expectedChecksum {
-			log.Printf("ERREUR CRITIQUE: Corruption détectée immédiatement après écriture!")
-			log.Printf("Checksum attendu: %s, checksum lu: %s", expectedChecksum, verifyChecksum)
-			orphanMutex.Lock()
-			orphanChunks[actualChecksum] = OrphanChunk{
-				Checksum: actualChecksum,
-				Offset:   uint64(offset),
-				Size:     uint32(bytesWritten),
-				Created:  time.Now(),
-			}
-			orphanMutex.Unlock()
-			saveOrphanChunks()
-			http.Error(w, "Corruption détectée après écriture", http.StatusInternalServerError)
-			return
-		}
+	if err := v.volumeFile.Sync(); err != nil {
+		log.Printf("ERREUR CRITIQUE (vol %s): Impossible de synchroniser les données sur disque: %v", v.config.Name, err)
 	}
 
 	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
-	log.Printf("Chunk écrit et vérifié (checksum OK: %s...): taille %d, offset %d", actualChecksum[:8], bytesWritten, offset)
 }
 
-func readChunkHandler(w http.ResponseWriter, r *http.Request) {
-	var offset, size int64
-	_, errO := fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
-	_, errS := fmt.Sscanf(r.URL.Query().Get("size"), "%d", &size)
-	if errO != nil || errS != nil || size <= 0 {
+func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
+	offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+	size, _ := strconv.ParseInt(r.URL.Query().Get("size"), 10, 64)
+	if size <= 0 {
 		http.Error(w, "Paramètres 'offset' et 'size' invalides", http.StatusBadRequest)
 		return
 	}
 
-	deletedMutex.RLock()
-	if _, isDeleted := deletedChunks[uint64(offset)]; isDeleted {
-		deletedMutex.RUnlock()
+	v.deletedMutex.RLock()
+	if _, isDeleted := v.deletedChunks[uint64(offset)]; isDeleted {
+		v.deletedMutex.RUnlock()
 		http.Error(w, "Chunk supprimé", http.StatusNotFound)
 		return
 	}
-	deletedMutex.RUnlock()
+	v.deletedMutex.RUnlock()
 
-	volumeMutex.Lock()
-	defer volumeMutex.Unlock()
-
-	// MODIFIÉ : Utilise le descripteur global au lieu d'ouvrir le fichier.
-	fileInfo, err := volumeFile.Stat()
-	if err != nil {
-		log.Printf("ERREUR LECTURE: Impossible de lire les métadonnées du volume: %v", err)
-		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
-		return
-	}
-
-	if offset+size > fileInfo.Size() {
-		log.Printf("ERREUR LECTURE: Tentative de lecture au-delà de la fin du fichier - offset:%d, size:%d, fichier:%d",
-			offset, size, fileInfo.Size())
-		http.Error(w, "Offset de lecture invalide - au-delà de la fin du fichier", http.StatusBadRequest)
-		return
-	}
-
-	// MODIFIÉ : Lecture depuis le descripteur de fichier global.
-	// ReadAt est idéal car il ne modifie pas le curseur du fichier.
 	chunkData := make([]byte, size)
-	bytesRead, err := volumeFile.ReadAt(chunkData, offset)
+
+	v.volumeMutex.Lock()
+	bytesRead, err := v.volumeFile.ReadAt(chunkData, offset)
+	v.volumeMutex.Unlock()
+
 	if err != nil {
-		log.Printf("ERREUR LECTURE: Échec de lecture à l'offset %d: %v", offset, err)
 		http.Error(w, "Erreur de lecture du chunk", http.StatusInternalServerError)
 		return
 	}
-
 	if int64(bytesRead) != size {
-		log.Printf("ERREUR LECTURE: Lecture incomplète - attendu:%d, lu:%d", size, bytesRead)
 		http.Error(w, "Lecture incomplète du chunk", http.StatusInternalServerError)
 		return
 	}
 
-	hash := sha256.Sum256(chunkData)
-	actualChecksum := hex.EncodeToString(hash[:])
-	w.Header().Set("X-Chunk-Checksum", actualChecksum)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-
-	bytesWritten, err := w.Write(chunkData)
-	if err != nil {
-		log.Printf("ERREUR LECTURE: Échec d'envoi des données au client: %v", err)
-		return
-	}
-	if bytesWritten != len(chunkData) {
-		log.Printf("ERREUR LECTURE: Envoi incomplet au client - envoyé:%d, total:%d",
-			bytesWritten, len(chunkData))
-		return
-	}
-
-	log.Printf("Chunk lu avec succès (checksum: %s...): taille %d, offset %d", actualChecksum[:8], size, offset)
+	w.Write(chunkData)
 }
 
-func markDeletedHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var deleteData struct {
-		Chunks []struct {
-			Offset uint64 `json:"offset"`
-			Size   uint32 `json:"size"`
-		} `json:"chunks"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&deleteData); err != nil {
-		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	deletedMutex.Lock()
-	chunksMarked := 0
-	for _, chunk := range deleteData.Chunks {
-		if _, exists := deletedChunks[chunk.Offset]; !exists {
-			deletedChunks[chunk.Offset] = chunk.Size
-			chunksMarked++
-		}
-	}
-	deletedMutex.Unlock()
-
-	if chunksMarked > 0 {
-		saveDeletedChunks()
-		log.Printf("%d chunks marqués pour suppression", chunksMarked)
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"marked": chunksMarked,
-		"total":  len(deleteData.Chunks),
-	})
-}
-
-func cleanupOrphanHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var cleanupData struct {
-		Chunks []struct {
-			Checksum string `json:"checksum"`
-			Offset   string `json:"offset"`
-			Size     string `json:"size"`
-		} `json:"chunks,omitempty"`
-		Checksum string `json:"checksum,omitempty"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&cleanupData); err != nil {
-		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	orphanMutex.Lock()
-	cleanedCount := 0
-
-	if cleanupData.Checksum != "" {
-		if _, exists := orphanChunks[cleanupData.Checksum]; exists {
-			delete(orphanChunks, cleanupData.Checksum)
-			cleanedCount++
-		}
-	}
-
-	for _, chunk := range cleanupData.Chunks {
-		if chunk.Checksum != "" {
-			if _, exists := orphanChunks[chunk.Checksum]; exists {
-				delete(orphanChunks, chunk.Checksum)
-				cleanedCount++
-			}
-		} else if chunk.Offset != "" && chunk.Size != "" {
-			offset, _ := strconv.ParseUint(chunk.Offset, 10, 64)
-			size, _ := strconv.ParseUint(chunk.Size, 10, 32)
-
-			for checksum, orphan := range orphanChunks {
-				if orphan.Offset == offset && orphan.Size == uint32(size) {
-					delete(orphanChunks, checksum)
-					cleanedCount++
-					break
-				}
-			}
-		}
-	}
-	orphanMutex.Unlock()
-
-	if cleanedCount > 0 {
-		saveOrphanChunks()
-		log.Printf("Nettoyage d'orphelins : %d chunks supprimés", cleanedCount)
-	}
-
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"cleaned": cleanedCount,
-	})
-}
-
-func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (v *Volume) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
 		"status":    "online",
-		"volume":    diskConfig.Name,
-		"diskId":    diskConfig.DiskID,
-		"freeSpace": getFreeSpaceBytes(),
+		"volume":    v.config.Name,
+		"diskId":    v.config.DiskID,
+		"freeSpace": v.getFreeSpaceBytes(),
 		"timestamp": time.Now().Unix(),
 	}
-
-	issues := make([]string, 0)
-
-	if _, err := os.Stat(volumePath); err != nil {
-		issues = append(issues, "volume file inaccessible")
-		health["status"] = "degraded"
-	}
-
-	freeSpace := getFreeSpaceBytes()
-	if freeSpace < 100*1024*1024 {
-		issues = append(issues, "low disk space")
-		health["status"] = "warning"
-	}
-
-	orphanMutex.RLock()
-	orphanCount := len(orphanChunks)
-	orphanMutex.RUnlock()
-
-	if orphanCount > 100 {
-		issues = append(issues, "too many orphan chunks")
-		health["status"] = "warning"
-	}
-
-	deletedMutex.RLock()
-	deletedCount := len(deletedChunks)
-	deletedMutex.RUnlock()
-
-	if deletedCount > 1000 {
-		issues = append(issues, "too many deleted chunks pending cleanup")
-		health["status"] = "warning"
-	}
-
-	health["orphan_chunks"] = orphanCount
-	health["deleted_chunks_pending"] = deletedCount
-
-	if len(issues) > 0 {
-		health["issues"] = issues
-	}
-
-	switch health["status"] {
-	case "degraded":
-		w.WriteHeader(http.StatusServiceUnavailable)
-	case "warning":
-		w.WriteHeader(http.StatusOK)
-	default:
-		w.WriteHeader(http.StatusOK)
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(health)
 }
 
-func compactHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (v *Volume) CompactHandler(w http.ResponseWriter, r *http.Request) {
 	var instruction CompactionInstruction
 	if err := json.NewDecoder(r.Body).Decode(&instruction); err != nil {
 		http.Error(w, "Corps de requête JSON invalide: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	offsetMap, err := compactVolume(instruction.ChunksToKeep)
+	offsetMap, err := v.compactVolume(instruction.ChunksToKeep)
 	if err != nil {
-		log.Printf("Erreur lors du compactage : %v", err)
+		log.Printf("Erreur lors du compactage (vol %s) : %v", v.config.Name, err)
 		http.Error(w, "Erreur interne lors du compactage", http.StatusInternalServerError)
 		return
 	}
 
 	stringOffsetMap := make(map[string]uint64)
-	if offsetMap != nil {
-		for k, v := range offsetMap {
-			stringOffsetMap[strconv.FormatUint(k, 10)] = v
-		}
+	for k, val := range offsetMap {
+		stringOffsetMap[strconv.FormatUint(k, 10)] = val
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -947,4 +498,140 @@ func compactHandler(w http.ResponseWriter, r *http.Request) {
 		"status":     "Compactage terminé",
 		"offset_map": stringOffsetMap,
 	})
+}
+
+func (v *Volume) compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, error) {
+	log.Printf("Début du compactage pour le volume '%s'", v.config.Name)
+
+	sort.Slice(chunksToKeep, func(i, j int) bool {
+		return chunksToKeep[i].Offset < chunksToKeep[j].Offset
+	})
+
+	v.volumeMutex.Lock()
+	defer v.volumeMutex.Unlock()
+
+	if err := v.volumeFile.Close(); err != nil {
+		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		return nil, fmt.Errorf("impossible de fermer le descripteur de fichier existant: %w", err)
+	}
+
+	originalFile, err := os.Open(v.volumePath)
+	if err != nil {
+		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		return nil, fmt.Errorf("impossible d'ouvrir le fichier original: %w", err)
+	}
+	defer originalFile.Close()
+
+	tempPath := v.volumePath + ".tmp"
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		return nil, fmt.Errorf("impossible de créer le fichier temporaire: %w", err)
+	}
+	defer tempFile.Close()
+
+	offsetMapping := make(map[uint64]uint64)
+	var currentWriteOffset uint64 = 0
+
+	for _, chunk := range chunksToKeep {
+		offsetMapping[chunk.Offset] = currentWriteOffset
+		bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size)), int64(chunk.Size))
+		if err != nil {
+			os.Remove(tempPath)
+			v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+			return nil, fmt.Errorf("erreur de copie du chunk: %w", err)
+		}
+		currentWriteOffset += uint64(bytesCopied)
+	}
+
+	if err := os.Rename(tempPath, v.volumePath); err != nil {
+		os.Remove(tempPath)
+		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		return nil, fmt.Errorf("impossible de remplacer le fichier original: %w", err)
+	}
+
+	v.volumeFile, err = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		log.Fatalf("ERREUR CRITIQUE (vol %s): Fichier de volume remplacé mais impossible de le rouvrir : %v", v.config.Name, err)
+	}
+
+	v.deletedMutex.Lock()
+	v.deletedChunks = make(map[uint64]uint32)
+	v.deletedMutex.Unlock()
+	v.saveDeletedChunks()
+
+	log.Printf("Compactage du volume '%s' terminé.", v.config.Name)
+	return offsetMapping, nil
+}
+
+func (v *Volume) MarkDeletedHandler(w http.ResponseWriter, r *http.Request) {
+	var deleteData struct {
+		Chunks []struct {
+			Offset uint64 `json:"offset"`
+			Size   uint32 `json:"size"`
+		} `json:"chunks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&deleteData); err != nil {
+		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	v.deletedMutex.Lock()
+	for _, chunk := range deleteData.Chunks {
+		v.deletedChunks[chunk.Offset] = chunk.Size
+	}
+	v.deletedMutex.Unlock()
+	v.saveDeletedChunks()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (v *Volume) VerifyChunkHandler(w http.ResponseWriter, r *http.Request) {
+	offset, _ := strconv.ParseUint(r.URL.Query().Get("offset"), 10, 64)
+	size, _ := strconv.ParseUint(r.URL.Query().Get("size"), 10, 32)
+	expectedChecksum := r.URL.Query().Get("checksum")
+
+	chunkData := make([]byte, size)
+	v.volumeMutex.Lock()
+	_, err := v.volumeFile.ReadAt(chunkData, int64(offset))
+	v.volumeMutex.Unlock()
+	if err != nil {
+		http.Error(w, "Chunk non lisible", http.StatusInternalServerError)
+		return
+	}
+
+	hash := sha256.Sum256(chunkData)
+	actualChecksum := hex.EncodeToString(hash[:])
+
+	if actualChecksum != expectedChecksum {
+		http.Error(w, "Checksum invalide", http.StatusConflict)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (v *Volume) CleanupOrphanHandler(w http.ResponseWriter, r *http.Request) {
+	var cleanupData struct {
+		Chunks []struct {
+			Checksum string `json:"checksum"`
+		} `json:"chunks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&cleanupData); err != nil {
+		http.Error(w, "JSON invalide", http.StatusBadRequest)
+		return
+	}
+
+	cleanedCount := 0
+	v.orphanMutex.Lock()
+	for _, chunk := range cleanupData.Chunks {
+		if _, exists := v.orphanChunks[chunk.Checksum]; exists {
+			delete(v.orphanChunks, chunk.Checksum)
+			cleanedCount++
+		}
+	}
+	v.orphanMutex.Unlock()
+
+	if cleanedCount > 0 {
+		v.saveOrphanChunks()
+	}
+	w.WriteHeader(http.StatusOK)
 }
