@@ -1,0 +1,359 @@
+<div class="header">
+    <h1>📁 Gestionnaire de Fichiers</h1>
+    <div class="user-info">
+        <span>Connecté en tant que <strong><%= @user[1] %></strong></span>
+        <a href="/logout" class="btn btn-small">Déconnexion</a>
+    </div>
+</div>
+
+<div class="container">
+    <!-- Fil d'Ariane -->
+    <div class="breadcrumb">
+        <a href="/">🏠 Accueil</a>
+        <% @breadcrumb.each do |crumb| %>
+            / <a href="/?folder_id=<%= crumb[:id] %>"><%= crumb[:name] %></a>
+        <% end %>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+        <div class="form-group">
+            <label>Créer un nouveau dossier</label>
+            <form method="post" action="/create_folder" style="display: flex; gap: 0.5rem;">
+                <input type="hidden" name="parent_id" value="<%= @current_folder_id %>">
+                <input type="text" name="folder_name" placeholder="Nom du dossier" required style="flex: 1;">
+                <button type="submit" class="btn">Créer</button>
+            </form>
+        </div>
+
+        <div class="form-group">
+            <label>Téléverser des fichiers</label>
+            <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click();">
+                <div class="upload-text">
+                    <div style="font-size: 2rem; margin-bottom: 0.5rem;">📁</div>
+                    <div><strong>Cliquez ici ou glissez-déposez vos fichiers</strong></div>
+                    <div style="font-size: 0.8rem; color: #666; margin-top: 0.5rem;">Ou sélectionnez plusieurs fichiers</div>
+                </div>
+            </div>
+            <input type="file" id="fileInput" multiple style="display: none;" onchange="handleFileSelect(this.files)">
+            
+            <div class="upload-progress" id="uploadProgress" style="display: none;">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">Préparation de l'upload...</div>
+            </div>
+
+            <div class="upload-queue" id="uploadQueue" style="display: none;">
+                <h4 style="margin-bottom: 0.5rem;">Files d'attente :</h4>
+            </div>
+
+            <!-- Fallback pour les navigateurs sans JavaScript -->
+            <noscript>
+                <form method="post" action="/upload_file" enctype="multipart/form-data" style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <input type="hidden" name="folder_id" value="<%= @current_folder_id %>">
+                    <input type="file" name="file" required style="flex: 1;">
+                    <button type="submit" class="btn">Téléverser</button>
+                </form>
+            </noscript>
+        </div>
+    </div>
+
+    <!-- Liste des dossiers et fichiers -->
+    <div class="file-list">
+        <!-- Dossier parent -->
+        <% if @current_folder_id %>
+            <div class="file-item">
+                <div class="file-icon">📁</div>
+                <div class="file-name">
+                    <a href="<%= @breadcrumb.length > 1 ? "/?folder_id=#{@breadcrumb[-2][:id]}" : "/" %>" style="text-decoration: none; color: #3498db;">
+                        .. (Dossier parent)
+                    </a>
+                </div>
+                <div></div>
+                <div></div>
+                <div></div>
+            </div>
+        <% end %>
+
+        <!-- Dossiers -->
+        <% @folders.each do |folder| %>
+            <div class="file-item">
+                <div class="file-icon">📁</div>
+                <div>
+                    <div id="folder-name-<%= folder[0] %>" class="file-name">
+                        <a href="/?folder_id=<%= folder[0] %>" style="text-decoration: none; color: #333;">
+                            <%= folder[1] %>
+                        </a>
+                    </div>
+                    <form id="folder-rename-<%= folder[0] %>" method="post" action="/rename_folder/<%= folder[0] %>" class="rename-form">
+                        <input type="text" name="new_name" value="<%= folder[1] %>" required>
+                        <button type="submit" class="btn btn-small">Sauver</button>
+                        <button type="button" class="btn btn-small" onclick="toggleRename(<%= folder[0] %>, 'folder')">Annuler</button>
+                    </form>
+                </div>
+                <div style="color: #666; font-size: 0.9rem;">Dossier</div>
+                <div style="color: #666; font-size: 0.9rem;"><%= folder[4] %></div>
+                <div class="file-actions">
+                    <button type="button" class="btn btn-small" onclick="toggleRename(<%= folder[0] %>, 'folder')">Renommer</button>
+                    <form method="post" action="/delete_folder/<%= folder[0] %>" style="display: inline;">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirmDelete('<%= folder[1] %>', 'folder')">Supprimer</button>
+                    </form>
+                </div>
+            </div>
+        <% end %>
+
+        <!-- Fichiers -->
+        <% @files.each do |file| %>
+            <div class="file-item">
+                <div class="file-icon">
+                    <% if is_image?(file[2]) %>
+                        🖼️
+                    <% else %>
+                        📄
+                    <% end %>
+                </div>
+                <div>
+                    <div id="file-name-<%= file[0] %>" class="file-name"><%= file[2] %></div>
+                    <form id="file-rename-<%= file[0] %>" method="post" action="/rename_file/<%= file[0] %>" class="rename-form">
+                        <input type="text" name="new_name" value="<%= file[2] %>" required>
+                        <button type="submit" class="btn btn-small">Sauver</button>
+                        <button type="button" class="btn btn-small" onclick="toggleRename(<%= file[0] %>, 'file')">Annuler</button>
+                    </form>
+                </div>
+                <div style="color: #666; font-size: 0.9rem;"><%= (file[5] / 1024.0 / 1024.0).round(2) %> MB</div>
+                <div style="color: #666; font-size: 0.9rem;"><%= file[6] %></div>
+                <div class="file-actions">
+                    <% if is_image?(file[2]) %>
+                        <button type="button" class="btn btn-small btn-preview" onclick="previewImage('<%= file[0] %>', '<%= file[2] %>')">Voir</button>
+                    <% end %>
+                    <a href="/download/<%= file[0] %>" class="btn btn-small">Télécharger</a>
+                    <button type="button" class="btn btn-small" onclick="toggleRename(<%= file[0] %>, 'file')">Renommer</button>
+                    <form method="post" action="/delete_file/<%= file[0] %>" style="display: inline;">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirmDelete('<%= file[2] %>', 'file')">Supprimer</button>
+                    </form>
+                </div>
+            </div>
+        <% end %>
+
+        <!-- Message si vide -->
+        <% if @folders.empty? && @files.empty? %>
+            <div class="file-item" style="text-align: center; color: #666; font-style: italic;">
+                <div style="grid-column: 1 / -1;">Ce dossier est vide</div>
+            </div>
+        <% end %>
+    </div>
+</div>
+
+<!-- Modale de prévisualisation d'image -->
+<div id="imageModal" class="modal" onclick="closeImageModal()">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <span class="close" onclick="closeImageModal()">&times;</span>
+        <div class="modal-header">
+            <h3 id="modalTitle">Prévisualisation</h3>
+        </div>
+        <div class="modal-body">
+            <img id="modalImage" src="" alt="Prévisualisation" style="max-width: 100%; max-height: 80vh; object-fit: contain;">
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn" onclick="closeImageModal()">Fermer</button>
+            <a id="modalDownloadBtn" href="#" class="btn" target="_blank">Télécharger</a>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentFolderId = '<%= @current_folder_id %>';
+let uploadQueue = [];
+let isUploading = false;
+
+function handleFileSelect(files) {
+    console.log('Fichiers sélectionnés:', files.length);
+    
+    if (files.length === 0) return;
+    
+    const uploadQueue = document.getElementById('uploadQueue');
+    uploadQueue.style.display = 'block';
+    uploadQueue.innerHTML = '<h4>Fichiers à uploader:</h4>';
+    
+    for (let i = 0; i < files.length; i++) {
+        const fileDiv = document.createElement('div');
+        fileDiv.innerHTML = `📄 ${files[i].name} (${(files[i].size / 1024 / 1024).toFixed(2)} MB)`;
+        fileDiv.style.padding = '0.5rem';
+        fileDiv.style.background = '#f8f9fa';
+        fileDiv.style.marginBottom = '0.5rem';
+        fileDiv.style.borderRadius = '4px';
+        uploadQueue.appendChild(fileDiv);
+    }
+    
+    setTimeout(() => {
+        startUpload(files);
+    }, 1000);
+}
+
+async function startUpload(files) {
+    const progressElement = document.getElementById('uploadProgress');
+    const progressFill = document.getElementById('progressFill');
+    const progressText = document.getElementById('progressText');
+    
+    progressElement.style.display = 'block';
+    
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const progress = ((i + 1) / files.length) * 100;
+        
+        progressFill.style.width = progress + '%';
+        progressText.textContent = `Upload ${i + 1}/${files.length}: ${file.name}`;
+        
+        try {
+            const success = await uploadFile(file);
+            console.log(`Upload ${file.name}:`, success ? 'Succès' : 'Échec');
+        } catch (error) {
+            console.error(`Erreur upload ${file.name}:`, error);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    progressText.textContent = 'Upload terminé !';
+    setTimeout(() => {
+        window.location.reload();
+    }, 1500);
+}
+
+function uploadFile(file) {
+    return new Promise((resolve) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        if (currentFolderId && currentFolderId !== 'null') {
+            formData.append('folder_id', currentFolderId);
+        }
+
+        const xhr = new XMLHttpRequest();
+
+        xhr.addEventListener('load', function() {
+            if (xhr.status === 200) {
+                try {
+                    const response = JSON.parse(xhr.responseText);
+                    resolve(response.success);
+                } catch (e) {
+                    resolve(false);
+                }
+            } else {
+                resolve(false);
+            }
+        });
+
+        xhr.addEventListener('error', function() {
+            resolve(false);
+        });
+
+        xhr.open('POST', '/upload_file_ajax');
+        xhr.send(formData);
+    });
+}
+
+function previewImage(fileId, fileName) {
+    const modal = document.getElementById('imageModal');
+    const modalImage = document.getElementById('modalImage');
+    const modalTitle = document.getElementById('modalTitle');
+    const modalDownloadBtn = document.getElementById('modalDownloadBtn');
+    
+    modalTitle.textContent = fileName;
+    modalImage.src = '/preview/' + fileId;
+    modalDownloadBtn.href = '/download/' + fileId;
+    
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+    
+    modalImage.onerror = function() {
+        modalImage.alt = 'Erreur lors du chargement de l\'image';
+        modalImage.style.display = 'none';
+        
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'error-message';
+        errorDiv.textContent = 'Impossible de charger l\'image';
+        errorDiv.style.textAlign = 'center';
+        errorDiv.style.padding = '2rem';
+        errorDiv.style.color = '#e74c3c';
+        
+        const modalBody = document.querySelector('.modal-body');
+        modalBody.appendChild(errorDiv);
+    };
+    
+    modalImage.onload = function() {
+        modalImage.style.display = 'block';
+        const errorMsg = document.querySelector('.error-message');
+        if (errorMsg) {
+            errorMsg.remove();
+        }
+    };
+}
+
+function closeImageModal() {
+    const modal = document.getElementById('imageModal');
+    const modalImage = document.getElementById('modalImage');
+    
+    modal.style.display = 'none';
+    document.body.style.overflow = '';
+    modalImage.src = '';
+    
+    const errorMsg = document.querySelector('.error-message');
+    if (errorMsg) {
+        errorMsg.remove();
+    }
+}
+
+function toggleRename(id, type) {
+    const nameElement = document.getElementById(type + '-name-' + id);
+    const formElement = document.getElementById(type + '-rename-' + id);
+    
+    if (formElement.classList.contains('active')) {
+        formElement.classList.remove('active');
+        nameElement.style.display = 'block';
+    } else {
+        formElement.classList.add('active');
+        nameElement.style.display = 'none';
+        formElement.querySelector('input[type="text"]').focus();
+    }
+}
+
+function confirmDelete(name, type) {
+    return confirm('Êtes-vous sûr de vouloir supprimer ' + (type === 'folder' ? 'le dossier' : 'le fichier') + ' "' + name + '" ?\n\nCette action est irréversible.');
+}
+
+// Gestion du drag and drop
+document.addEventListener('DOMContentLoaded', function() {
+    const uploadArea = document.getElementById('uploadArea');
+    
+    if (uploadArea) {
+        uploadArea.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadArea.style.backgroundColor = '#e3f2fd';
+            uploadArea.style.borderColor = '#3498db';
+        });
+
+        uploadArea.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            uploadArea.style.backgroundColor = '';
+            uploadArea.style.borderColor = '#ddd';
+        });
+
+        uploadArea.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadArea.style.backgroundColor = '';
+            uploadArea.style.borderColor = '#ddd';
+            
+            const files = e.dataTransfer.files;
+            handleFileSelect(files);
+        });
+    }
+});
+
+// Fermer la modale avec la touche Escape
+document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape') {
+        closeImageModal();
+    }
+});
+</script>
