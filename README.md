@@ -1,6 +1,6 @@
 # 🌳 PureFS
 
-PureFS est un système de stockage qui protège vos fichiers en les copiant automatiquement sur plusieurs disques. Ce guide explique de manière concrète comment l'utiliser via son interface web et son API.
+PureFS est un système de stockage distribué conçu spécifiquement pour pouvoir remplacer des disques à chaud sans perdre de données.
 
 ## 🖥️ Interface Web
 
