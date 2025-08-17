@@ -23,6 +23,29 @@ const (
 	volumeSizeGB = 30
 )
 
+// --- Pools d'optimisation ---
+var (
+	// Pool de buffers pour éviter les allocations répétées
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 64*1024) // Buffer de 64KB
+		},
+	}
+	
+	// Pool de clients HTTP
+	httpClientPool = sync.Pool{
+		New: func() interface{} {
+			return &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 5,
+					IdleConnTimeout:     60 * time.Second,
+				},
+			}
+		},
+	}
+)
+
 // Config contient tous les paramètres nécessaires pour créer une instance de Volume.
 type Config struct {
 	Name       string
@@ -57,23 +80,29 @@ type CompactionInstruction struct {
 type Volume struct {
 	config        Config
 	volumePath    string
-	volumeFile    *os.File
-	volumeMutex   *sync.Mutex
+	
+	// Pool de descripteurs de fichiers pour optimiser les I/O
+	fileHandles   []*os.File
+	filePoolMutex sync.RWMutex
+	currentHandle int
+	
+	// Optimisation: pas de mutex global, utilisation de RWMutex pour les métadonnées
 	deletedChunks map[uint64]uint32
-	deletedMutex  *sync.RWMutex
+	deletedMutex  sync.RWMutex
 	orphanChunks  map[string]OrphanChunk
-	orphanMutex   *sync.RWMutex
+	orphanMutex   sync.RWMutex
+	
+	// Channel pour la synchronisation asynchrone
+	syncRequests chan struct{}
 }
 
 // New crée et initialise une nouvelle instance de Volume.
 func New(cfg Config) (*Volume, error) {
 	v := &Volume{
 		config:        cfg,
-		volumeMutex:   &sync.Mutex{},
 		deletedChunks: make(map[uint64]uint32),
-		deletedMutex:  &sync.RWMutex{},
 		orphanChunks:  make(map[string]OrphanChunk),
-		orphanMutex:   &sync.RWMutex{},
+		syncRequests:  make(chan struct{}, 10), // Buffer pour les demandes de sync
 	}
 
 	volumeFileName := fmt.Sprintf("%s.dat", v.config.Name)
@@ -85,10 +114,9 @@ func New(cfg Config) (*Volume, error) {
 		return nil, fmt.Errorf("erreur lors de la création du fichier pour le volume %s: %w", v.config.Name, err)
 	}
 
-	var err error
-	v.volumeFile, err = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("impossible d'ouvrir le fichier de volume '%s': %w", v.config.Name, err)
+	// Créer un pool de descripteurs de fichiers pour optimiser les I/O
+	if err := v.initFileHandlePool(); err != nil {
+		return nil, fmt.Errorf("impossible d'initialiser le pool de descripteurs de fichiers: %w", err)
 	}
 
 	v.loadDeletedChunks()
@@ -97,20 +125,107 @@ func New(cfg Config) (*Volume, error) {
 	return v, nil
 }
 
+// Initialiser le pool de descripteurs de fichiers
+func (v *Volume) initFileHandlePool() error {
+	const poolSize = 4 // 4 descripteurs pour les opérations parallèles
+	v.fileHandles = make([]*os.File, poolSize)
+	
+	for i := 0; i < poolSize; i++ {
+		file, err := os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			// Nettoyer les descripteurs déjà ouverts en cas d'erreur
+			for j := 0; j < i; j++ {
+				if v.fileHandles[j] != nil {
+					v.fileHandles[j].Close()
+				}
+			}
+			return fmt.Errorf("impossible d'ouvrir le descripteur de fichier %d: %w", i, err)
+		}
+		v.fileHandles[i] = file
+	}
+	
+	return nil
+}
+
+// Obtenir un descripteur de fichier du pool
+func (v *Volume) getFileHandle() *os.File {
+	v.filePoolMutex.Lock()
+	defer v.filePoolMutex.Unlock()
+	
+	handle := v.fileHandles[v.currentHandle]
+	v.currentHandle = (v.currentHandle + 1) % len(v.fileHandles)
+	return handle
+}
+
 // Start lance les tâches de fond du volume (heartbeats). C'est une méthode non-bloquante.
 func (v *Volume) Start() error {
 	log.Printf("Démarrage de la logique du volume '%s'...", v.config.Name)
 
 	if err := v.initialRegister(); err != nil {
-		v.volumeFile.Close() // Nettoyage en cas d'échec
+		v.cleanup() // Nettoyage en cas d'échec
 		return fmt.Errorf("impossible de démarrer le volume '%s'. Erreur d'enregistrement : %w", v.config.Name, err)
 	}
 
+	// Démarrer les workers de fond
 	go v.cleanupOldOrphans()
 	go v.registerWithServer() // Tâche de fond pour les heartbeats
+	go v.syncWorker()         // Worker pour les synchronisations asynchrones
 
 	log.Printf("Volume '%s' est prêt et envoie des heartbeats.", v.config.Name)
 	return nil
+}
+
+// Worker pour gérer les synchronisations de manière asynchrone
+func (v *Volume) syncWorker() {
+	ticker := time.NewTicker(5 * time.Second) // Sync toutes les 5 secondes
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Sync périodique
+			v.performSync()
+		case <-v.syncRequests:
+			// Sync sur demande (non-bloquant)
+			v.performSync()
+		}
+	}
+}
+
+// Effectuer la synchronisation sur tous les descripteurs de fichiers
+func (v *Volume) performSync() {
+	v.filePoolMutex.RLock()
+	defer v.filePoolMutex.RUnlock()
+	
+	for _, handle := range v.fileHandles {
+		if handle != nil {
+			if err := handle.Sync(); err != nil {
+				log.Printf("ERREUR SYNC (vol %s): %v", v.config.Name, err)
+			}
+		}
+	}
+}
+
+// Demander une synchronisation de manière non-bloquante
+func (v *Volume) requestSync() {
+	select {
+	case v.syncRequests <- struct{}{}:
+		// Demande de sync envoyée
+	default:
+		// Channel plein, ignore (le sync périodique s'en chargera)
+	}
+}
+
+// Nettoyage des ressources
+func (v *Volume) cleanup() {
+	v.filePoolMutex.Lock()
+	defer v.filePoolMutex.Unlock()
+	
+	for _, handle := range v.fileHandles {
+		if handle != nil {
+			handle.Close()
+		}
+	}
 }
 
 // --- Logique Métier (interne au volume) ---
@@ -273,7 +388,9 @@ func (v *Volume) cleanupOldOrphans() {
 func (v *Volume) getFreeSpaceBytes() uint64 {
 	totalBytes := uint64(volumeSizeGB) * 1024 * 1024 * 1024
 
-	fileInfo, err := v.volumeFile.Stat()
+	// Utiliser un handle du pool pour vérifier la taille
+	handle := v.getFileHandle()
+	fileInfo, err := handle.Stat()
 	if err != nil {
 		return totalBytes // Si le fichier n'a pas de taille, on considère tout l'espace comme libre
 	}
@@ -303,11 +420,19 @@ func (v *Volume) buildStatusPayload(requestType string) ([]byte, error) {
 		"type":       requestType,
 		"name":       v.config.Name,
 		"diskId":     v.config.DiskID,
-		"address":    v.config.ListenAddr, // Utilise l'adresse de l'agent
+		"address":    v.config.ListenAddr,
 		"totalSpace": uint64(volumeSizeGB) * 1024 * 1024 * 1024,
 		"freeSpace":  v.getFreeSpaceBytes(),
 	}
 	return json.Marshal(status)
+}
+
+func (v *Volume) getHTTPClient() *http.Client {
+	return httpClientPool.Get().(*http.Client)
+}
+
+func (v *Volume) putHTTPClient(client *http.Client) {
+	httpClientPool.Put(client)
 }
 
 func (v *Volume) initialRegister() error {
@@ -317,7 +442,11 @@ func (v *Volume) initialRegister() error {
 	}
 
 	serverURL := fmt.Sprintf("http://%s/api/disk/register", v.config.ServerAddr)
-	resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
+	
+	client := v.getHTTPClient()
+	defer v.putHTTPClient(client)
+	
+	resp, err := client.Post(serverURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
 		return fmt.Errorf("erreur de connexion au serveur %s : %w", v.config.ServerAddr, err)
 	}
@@ -348,7 +477,11 @@ func (v *Volume) registerWithServer() {
 		}
 
 		serverURL := fmt.Sprintf("http://%s/api/disk/register", v.config.ServerAddr)
-		resp, err := http.Post(serverURL, "application/json", bytes.NewBuffer(payload))
+		
+		client := v.getHTTPClient()
+		resp, err := client.Post(serverURL, "application/json", bytes.NewBuffer(payload))
+		v.putHTTPClient(client)
+		
 		if err != nil {
 			log.Printf("Erreur (vol %s): connexion au serveur %s : %v", v.config.Name, v.config.ServerAddr, err)
 		} else {
@@ -361,7 +494,7 @@ func (v *Volume) registerWithServer() {
 	}
 }
 
-// --- Handlers (maintenant des méthodes publiques appelées par l'agent) ---
+// --- Handlers Optimisés (maintenant des méthodes publiques appelées par l'agent) ---
 
 func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -375,10 +508,27 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chunkData, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
-		return
+	// Utiliser un buffer du pool pour la lecture
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
+
+	// Lire les données avec un buffer optimisé
+	var chunkData []byte
+	var totalRead int
+	
+	for {
+		n, err := r.Body.Read(buffer)
+		if n > 0 {
+			chunkData = append(chunkData, buffer[:n]...)
+			totalRead += n
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if v.getFreeSpaceBytes() < uint64(len(chunkData)) {
@@ -395,20 +545,24 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v.volumeMutex.Lock()
-	defer v.volumeMutex.Unlock()
-
-	offset, err := v.volumeFile.Seek(0, io.SeekEnd)
+	// Obtenir un descripteur de fichier du pool
+	handle := v.getFileHandle()
+	
+	offset, err := handle.Seek(0, io.SeekEnd)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 
-	bytesWritten, err := v.volumeFile.Write(chunkData)
+	bytesWritten, err := handle.Write(chunkData)
 	if err != nil {
+		// En cas d'erreur, marquer comme orphelin
 		v.orphanMutex.Lock()
 		v.orphanChunks[actualChecksum] = OrphanChunk{
-			Checksum: actualChecksum, Offset: uint64(offset), Size: uint32(len(chunkData)), Created: time.Now(),
+			Checksum: actualChecksum, 
+			Offset:   uint64(offset), 
+			Size:     uint32(len(chunkData)), 
+			Created:  time.Now(),
 		}
 		v.orphanMutex.Unlock()
 		v.saveOrphanChunks()
@@ -416,9 +570,8 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := v.volumeFile.Sync(); err != nil {
-		log.Printf("ERREUR CRITIQUE (vol %s): Impossible de synchroniser les données sur disque: %v", v.config.Name, err)
-	}
+	// Demander une synchronisation asynchrone au lieu d'un sync bloquant
+	v.requestSync()
 
 	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)}
 	w.Header().Set("Content-Type", "application/json")
@@ -433,6 +586,7 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Vérification rapide de suppression avec RLock
 	v.deletedMutex.RLock()
 	if _, isDeleted := v.deletedChunks[uint64(offset)]; isDeleted {
 		v.deletedMutex.RUnlock()
@@ -441,24 +595,23 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	v.deletedMutex.RUnlock()
 
-	chunkData := make([]byte, size)
-
-	v.volumeMutex.Lock()
-	bytesRead, err := v.volumeFile.ReadAt(chunkData, offset)
-	v.volumeMutex.Unlock()
-
-	if err != nil {
-		http.Error(w, "Erreur de lecture du chunk", http.StatusInternalServerError)
-		return
-	}
-	if int64(bytesRead) != size {
-		http.Error(w, "Lecture incomplète du chunk", http.StatusInternalServerError)
-		return
-	}
+	// Obtenir un descripteur de fichier du pool
+	handle := v.getFileHandle()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	w.Write(chunkData)
+
+	// Utiliser un buffer du pool pour la lecture
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
+
+	// Streaming direct pour éviter de charger tout en mémoire
+	reader := io.NewSectionReader(handle, offset, size)
+	_, err := io.CopyBuffer(w, reader, buffer)
+	
+	if err != nil {
+		log.Printf("Erreur de lecture/streaming du chunk (vol %s): %v", v.config.Name, err)
+	}
 }
 
 func (v *Volume) HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -507,25 +660,28 @@ func (v *Volume) compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, e
 		return chunksToKeep[i].Offset < chunksToKeep[j].Offset
 	})
 
-	v.volumeMutex.Lock()
-	defer v.volumeMutex.Unlock()
-
-	if err := v.volumeFile.Close(); err != nil {
-		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		return nil, fmt.Errorf("impossible de fermer le descripteur de fichier existant: %w", err)
+	// Fermer tous les descripteurs pendant le compactage
+	v.filePoolMutex.Lock()
+	for _, handle := range v.fileHandles {
+		if handle != nil {
+			handle.Close()
+		}
 	}
+	v.filePoolMutex.Unlock()
 
+	// Ouvrir le fichier original en lecture
 	originalFile, err := os.Open(v.volumePath)
 	if err != nil {
-		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		v.initFileHandlePool() // Réinitialiser le pool en cas d'erreur
 		return nil, fmt.Errorf("impossible d'ouvrir le fichier original: %w", err)
 	}
 	defer originalFile.Close()
 
+	// Créer le fichier temporaire
 	tempPath := v.volumePath + ".tmp"
 	tempFile, err := os.Create(tempPath)
 	if err != nil {
-		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		v.initFileHandlePool()
 		return nil, fmt.Errorf("impossible de créer le fichier temporaire: %w", err)
 	}
 	defer tempFile.Close()
@@ -533,28 +689,42 @@ func (v *Volume) compactVolume(chunksToKeep []ChunkToKeep) (map[uint64]uint64, e
 	offsetMapping := make(map[uint64]uint64)
 	var currentWriteOffset uint64 = 0
 
+	// Utiliser un buffer optimisé pour la copie
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
+
 	for _, chunk := range chunksToKeep {
 		offsetMapping[chunk.Offset] = currentWriteOffset
-		bytesCopied, err := io.CopyN(tempFile, io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size)), int64(chunk.Size))
+		
+		// Copie optimisée avec buffer
+		reader := io.NewSectionReader(originalFile, int64(chunk.Offset), int64(chunk.Size))
+		bytesCopied, err := io.CopyBuffer(tempFile, reader, buffer)
+		
 		if err != nil {
 			os.Remove(tempPath)
-			v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+			v.initFileHandlePool()
 			return nil, fmt.Errorf("erreur de copie du chunk: %w", err)
 		}
 		currentWriteOffset += uint64(bytesCopied)
 	}
 
+	// Fermer les fichiers avant le remplacement
+	originalFile.Close()
+	tempFile.Close()
+
+	// Remplacer le fichier original
 	if err := os.Rename(tempPath, v.volumePath); err != nil {
 		os.Remove(tempPath)
-		v.volumeFile, _ = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+		v.initFileHandlePool()
 		return nil, fmt.Errorf("impossible de remplacer le fichier original: %w", err)
 	}
 
-	v.volumeFile, err = os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("ERREUR CRITIQUE (vol %s): Fichier de volume remplacé mais impossible de le rouvrir : %v", v.config.Name, err)
+	// Réinitialiser le pool de descripteurs
+	if err := v.initFileHandlePool(); err != nil {
+		log.Fatalf("ERREUR CRITIQUE (vol %s): Impossible de réinitialiser le pool de descripteurs après compactage: %v", v.config.Name, err)
 	}
 
+	// Nettoyer les chunks supprimés
 	v.deletedMutex.Lock()
 	v.deletedChunks = make(map[uint64]uint32)
 	v.deletedMutex.Unlock()
@@ -575,13 +745,22 @@ func (v *Volume) MarkDeletedHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "JSON invalide: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	
 	v.deletedMutex.Lock()
 	for _, chunk := range deleteData.Chunks {
 		v.deletedChunks[chunk.Offset] = chunk.Size
 	}
 	v.deletedMutex.Unlock()
-	v.saveDeletedChunks()
+	
+	// Sauvegarde asynchrone pour ne pas bloquer la réponse
+	go v.saveDeletedChunks()
+	
 	w.WriteHeader(http.StatusOK)
+}
+
+// GetName retourne le nom du volume (nécessaire pour l'agent)
+func (v *Volume) GetName() string {
+	return v.config.Name
 }
 
 func (v *Volume) VerifyChunkHandler(w http.ResponseWriter, r *http.Request) {
@@ -589,10 +768,24 @@ func (v *Volume) VerifyChunkHandler(w http.ResponseWriter, r *http.Request) {
 	size, _ := strconv.ParseUint(r.URL.Query().Get("size"), 10, 32)
 	expectedChecksum := r.URL.Query().Get("checksum")
 
+	// Vérification rapide de suppression
+	v.deletedMutex.RLock()
+	if _, isDeleted := v.deletedChunks[offset]; isDeleted {
+		v.deletedMutex.RUnlock()
+		http.Error(w, "Chunk supprimé", http.StatusNotFound)
+		return
+	}
+	v.deletedMutex.RUnlock()
+
+	// Utiliser un buffer du pool
+	buffer := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buffer)
+	
+	// Redimensionner le buffer si nécessaire
 	chunkData := make([]byte, size)
-	v.volumeMutex.Lock()
-	_, err := v.volumeFile.ReadAt(chunkData, int64(offset))
-	v.volumeMutex.Unlock()
+	
+	handle := v.getFileHandle()
+	_, err := handle.ReadAt(chunkData, int64(offset))
 	if err != nil {
 		http.Error(w, "Chunk non lisible", http.StatusInternalServerError)
 		return
@@ -631,7 +824,9 @@ func (v *Volume) CleanupOrphanHandler(w http.ResponseWriter, r *http.Request) {
 	v.orphanMutex.Unlock()
 
 	if cleanedCount > 0 {
-		v.saveOrphanChunks()
+		// Sauvegarde asynchrone
+		go v.saveOrphanChunks()
 	}
+	
 	w.WriteHeader(http.StatusOK)
 }
