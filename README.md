@@ -57,7 +57,7 @@ C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut
 -   **Action :** Ce bloc apparaît si un fichier est "Sur-protégé". Cliquez sur le bouton bleu "Nettoyer les copies en surplus".
 -   **Comment ça marche :** Le système identifie les blocs qui ont plus de 2 copies et supprime les copies excédentaires pour libérer de l'espace.
 
-## ⚙️ Utilisation via l'API REST
+## ⚙️ API REST
 
 Pour une utilisation programmatique ou via des scripts, toutes les actions de l'interface web sont disponibles via une API REST simple.
 
