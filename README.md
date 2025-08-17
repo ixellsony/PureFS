@@ -2,7 +2,7 @@
 
 PureFS est un système de stockage qui protège vos fichiers en les copiant automatiquement sur plusieurs disques. Ce guide explique de manière concrète comment l'utiliser via son interface web et son API.
 
-## 🖥️ Utilisation via l'Interface Web (Le Panneau de Contrôle)
+## 🖥️ Interface Web
 
 Une fois le serveur démarré, ouvrez votre navigateur à l'adresse `http://localhost:8080`. Vous y trouverez le panneau de contrôle, qui est votre principal outil de gestion.
 
