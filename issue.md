@@ -76,10 +76,6 @@ Ce sont des points qui ne causeront probablement pas de perte de données imméd
 
 ### Conclusion Finale
 
-**Vous pouvez l'utiliser pour votre famille**, à condition de :
-
 1.  **Corriger impérativement le goulot d'étranglement à l'écriture** dans `volume.go`.
 2.  **Corriger la mise hors ligne agressive** lors du téléchargement dans `server.go`.
 3.  **Sauvegarder régulièrement le fichier `index.idx` !** C'est le cerveau de votre système. S'il est perdu (et que vous n'avez pas de SPOF, donc pas de réplique de ce serveur), toutes vos données sont logiquement perdues. Une simple tâche `cron` qui copie le fichier toutes les heures dans un autre endroit est une sécurité indispensable.
-
-Le code est robuste, bien pensé et montre une excellente compréhension des enjeux. Félicitations pour ce travail de grande qualité 
