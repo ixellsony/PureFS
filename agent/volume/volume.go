@@ -485,8 +485,6 @@ func (v *Volume) registerWithServer() {
 	}
 }
 
-// --- Handlers Optimisés (maintenant des méthodes publiques appelées par l'agent) ---
-
 func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Méthode non autorisée", http.StatusMethodNotAllowed)
@@ -499,7 +497,7 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// CORRECTION: Lire tout le body en une fois pour éviter les corruptions
+	// Lire tout le body en une fois
 	chunkData, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
@@ -512,36 +510,42 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Vérifier le checksum AVANT l'écriture
 	hash := sha256.Sum256(chunkData)
 	actualChecksum := hex.EncodeToString(hash[:])
-
 	if actualChecksum != expectedChecksum {
 		http.Error(w, "Checksum invalide.", http.StatusBadRequest)
 		return
 	}
 
-	// CORRECTION: Ouvrir un nouveau descripteur dédié pour l'écriture
-	file, err := os.OpenFile(v.volumePath, os.O_WRONLY|os.O_CREATE, 0644)
+	// NOUVEAU CODE: Écriture thread-safe avec mutex
+	v.filePoolMutex.Lock()
+	defer v.filePoolMutex.Unlock()
+
+	// Ouvrir le fichier en mode lecture/écriture
+	file, err := os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		http.Error(w, "Erreur d'ouverture du fichier", http.StatusInternalServerError)
 		return
 	}
 	defer file.Close()
-	
+
+	// Aller à la fin du fichier pour obtenir l'offset
 	offset, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 
+	// Écrire le chunk d'un coup
 	bytesWritten, err := file.Write(chunkData)
 	if err != nil {
-		// En cas d'erreur, marquer comme orphelin
+		// Marquer comme orphelin en cas d'erreur
 		v.orphanMutex.Lock()
 		v.orphanChunks[actualChecksum] = OrphanChunk{
-			Checksum: actualChecksum, 
-			Offset:   uint64(offset), 
-			Size:     uint32(len(chunkData)), 
+			Checksum: actualChecksum,
+			Offset:   uint64(offset),
+			Size:     uint32(len(chunkData)),
 			Created:  time.Now(),
 		}
 		v.orphanMutex.Unlock()
@@ -550,9 +554,33 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// CORRECTION: Sync immédiat pour garantir l'écriture
+	// Vérifier que tout a été écrit
+	if bytesWritten != len(chunkData) {
+		http.Error(w, fmt.Sprintf("Écriture incomplète: %d/%d bytes", bytesWritten, len(chunkData)), http.StatusInternalServerError)
+		return
+	}
+
+	// Sync immédiat pour garantir l'écriture sur disque
 	if err := file.Sync(); err != nil {
 		log.Printf("ATTENTION: Sync échoué (vol %s): %v", v.config.Name, err)
+	}
+
+	// Vérification immédiate en relisant le chunk
+	verificationData := make([]byte, len(chunkData))
+	readBytes, err := file.ReadAt(verificationData, offset)
+	if err != nil || readBytes != len(chunkData) {
+		log.Printf("ERREUR VERIFICATION (vol %s): Impossible de relire le chunk écrit", v.config.Name)
+		http.Error(w, "Erreur de vérification post-écriture", http.StatusInternalServerError)
+		return
+	}
+
+	// Vérifier le checksum du chunk relu
+	verifyHash := sha256.Sum256(verificationData)
+	verifyChecksum := hex.EncodeToString(verifyHash[:])
+	if verifyChecksum != expectedChecksum {
+		log.Printf("CORRUPTION DETECTEE (vol %s): Checksum après écriture != checksum attendu", v.config.Name)
+		http.Error(w, "Corruption détectée après écriture", http.StatusInternalServerError)
+		return
 	}
 
 	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)}
@@ -568,7 +596,7 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Vérification rapide de suppression avec RLock
+	// Vérification de suppression
 	v.deletedMutex.RLock()
 	if _, isDeleted := v.deletedChunks[uint64(offset)]; isDeleted {
 		v.deletedMutex.RUnlock()
@@ -577,7 +605,10 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	v.deletedMutex.RUnlock()
 
-	// CORRECTION: Ouvrir un nouveau descripteur de fichier dédié pour éviter les conflits
+	// Lecture thread-safe
+	v.filePoolMutex.RLock()
+	defer v.filePoolMutex.RUnlock()
+
 	file, err := os.Open(v.volumePath)
 	if err != nil {
 		http.Error(w, "Erreur d'ouverture du fichier", http.StatusInternalServerError)
@@ -585,33 +616,35 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-
-	// CORRECTION: Lire tout le chunk en une fois pour éviter EOF
+	// Allouer le buffer exact
 	chunkData := make([]byte, size)
-	n, err := file.ReadAt(chunkData, offset)
-	if err != nil && err != io.EOF {
-		log.Printf("Erreur de lecture du chunk (vol %s): %v", v.config.Name, err)
+	
+	// Lecture avec ReadAt pour éviter les problèmes de position
+	readBytes, err := file.ReadAt(chunkData, offset)
+	if err != nil {
+		log.Printf("Erreur de lecture du chunk (vol %s): offset=%d size=%d err=%v", v.config.Name, offset, size, err)
 		http.Error(w, "Erreur de lecture", http.StatusInternalServerError)
 		return
 	}
-	
-	if int64(n) != size {
-		log.Printf("Lecture incomplète (vol %s): attendu %d bytes, lu %d bytes", v.config.Name, size, n)
+
+	if int64(readBytes) != size {
+		log.Printf("Lecture incomplète (vol %s): attendu %d bytes, lu %d bytes", v.config.Name, size, readBytes)
 		http.Error(w, "Lecture incomplète", http.StatusInternalServerError)
 		return
 	}
 
-	// CORRECTION: Écrire tout le chunk en une fois
-	written, err := w.Write(chunkData[:n])
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+
+	// Écrire toutes les données d'un coup
+	written, err := w.Write(chunkData)
 	if err != nil {
 		log.Printf("Erreur d'écriture de la réponse (vol %s): %v", v.config.Name, err)
 		return
 	}
-	
-	if written != n {
-		log.Printf("Écriture incomplète de la réponse (vol %s): attendu %d bytes, écrit %d bytes", v.config.Name, n, written)
+
+	if written != int(size) {
+		log.Printf("Écriture incomplète de la réponse (vol %s): attendu %d bytes, écrit %d bytes", v.config.Name, size, written)
 	}
 }
 
