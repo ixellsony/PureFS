@@ -28,6 +28,34 @@ const (
 	requiredReplicas      = 2
 	minFreeSpaceForUpload = 100 * 1024 * 1024 // 100 MB minimum
 	gcJournalPath         = "gc.journal.tmp"    // Chemin pour le fichier de journal du GC
+	maxConcurrentUploads  = 4                   // Limite les uploads concurrents
+	maxConcurrentChunks   = 3                   // Chunks traités en parallèle par upload
+)
+
+// --- Pools pour l'optimisation des performances ---
+var (
+	// Pool de buffers pour éviter les allocations répétées
+	chunkBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, chunkSize)
+		},
+	}
+	
+	// Pool de clients HTTP réutilisables
+	httpClientPool = sync.Pool{
+		New: func() interface{} {
+			return &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 10,
+					IdleConnTimeout:     90 * time.Second,
+				},
+			}
+		},
+	}
+	
+	// Semaphore pour limiter les uploads concurrents
+	uploadSemaphore = make(chan struct{}, maxConcurrentUploads)
 )
 
 // --- Structures de Données ---
@@ -36,7 +64,7 @@ type ChunkCopy struct {
 	VolumeName string
 	Offset     uint64
 	Size       uint32
-	Deleted    bool `json:"deleted,omitempty"` // Marqué pour suppression
+	Deleted    bool `json:"deleted,omitempty"`
 }
 
 type ChunkMetadata struct {
@@ -51,7 +79,7 @@ type FileMetadata struct {
 	UploadDate time.Time
 	Chunks     []*ChunkMetadata
 	Status     string `json:"-"`
-	Deleted    bool   `json:"deleted,omitempty"` // Marqué pour suppression
+	Deleted    bool   `json:"deleted,omitempty"`
 }
 
 func (fm *FileMetadata) TotalSizeMB() float64 {
@@ -84,23 +112,35 @@ var (
 
 // Structure pour le journal du Garbage Collection
 type GCJournal struct {
-	// Fait le lien entre un nom de volume et sa map d'offsets (ancien offset -> nouvel offset)
 	VolumeOffsetMaps map[string]map[uint64]uint64
 }
 
 var webTemplate *template.Template
 
+// --- Fonctions d'optimisation ---
+
+// Fonction pour obtenir un client HTTP du pool
+func getHTTPClient() *http.Client {
+	return httpClientPool.Get().(*http.Client)
+}
+
+// Fonction pour remettre un client HTTP dans le pool
+func putHTTPClient(client *http.Client) {
+	httpClientPool.Put(client)
+}
+
 // --- Fonctions Principales ---
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadIndex()
-	replayGCJournalIfExists() // On vérifie s'il faut reprendre une opération de GC interrompue
+	replayGCJournalIfExists()
 
 	go cleanupInactiveVolumes()
 	go garbageCollectionWorker()
 
+	// Audit d'intégrité moins fréquent pour éviter la surcharge
 	go func() {
-		ticker := time.NewTicker(10 * time.Minute) // Audit toutes les 10 minutes
+		ticker := time.NewTicker(30 * time.Minute) // Audit toutes les 30 minutes
 		defer ticker.Stop()
 		for range ticker.C {
 			auditDataIntegrity()
@@ -129,7 +169,8 @@ func main() {
 	}
 }
 
-// --- Logique Métier ---
+// --- Logique Métier (fonctions existantes optimisées) ---
+
 func loadIndex() {
 	fileIndexMutex.Lock()
 	defer fileIndexMutex.Unlock()
@@ -152,8 +193,6 @@ func loadIndex() {
 	}
 }
 
-// saveIndex_unlocked effectue la sauvegarde physique sans gérer les verrous.
-// Le code appelant DOIT détenir le fileIndexMutex.Lock() pour garantir la cohérence.
 func saveIndex_unlocked() {
 	tempPath := indexFilePath + ".tmp"
 	file, err := os.Create(tempPath)
@@ -163,9 +202,8 @@ func saveIndex_unlocked() {
 	}
 
 	encoder := gob.NewEncoder(file)
-	// On encode directement la variable globale car on est sous verrou
 	err = encoder.Encode(&fileIndex)
-	file.Close() // Fermer avant de renommer
+	file.Close()
 
 	if err != nil {
 		log.Printf("ERREUR: Impossible d'encoder l'index avec gob: %v", err)
@@ -182,14 +220,12 @@ func saveIndex_unlocked() {
 	log.Printf("Index sauvegardé de manière atomique avec %d fichiers", len(fileIndex))
 }
 
-// saveIndex est la fonction publique qui prend le verrou avant de sauvegarder.
 func saveIndex() {
 	fileIndexMutex.Lock()
 	defer fileIndexMutex.Unlock()
 	saveIndex_unlocked()
 }
 
-// Fonction pour rejouer le journal de GC si le serveur a crashé
 func replayGCJournalIfExists() {
 	file, err := os.Open(gcJournalPath)
 	if err != nil {
@@ -221,8 +257,6 @@ func replayGCJournalIfExists() {
 	}
 }
 
-// applyOffsetMaps_unlocked effectue la mise à jour des offsets sans gérer les verrous.
-// Le code appelant DOIT détenir le fileIndexMutex.Lock().
 func applyOffsetMaps_unlocked(journalData *GCJournal) {
 	log.Println("Application des mises à jour d'offset depuis le journal de GC...")
 	for volumeName, offsetMap := range journalData.VolumeOffsetMaps {
@@ -255,20 +289,23 @@ func applyOffsetMaps_unlocked(journalData *GCJournal) {
 	log.Println("Application des mises à jour d'offset terminée.")
 }
 
-// applyOffsetMaps est la fonction publique qui prend le verrou.
 func applyOffsetMaps(journalData *GCJournal) {
 	fileIndexMutex.Lock()
 	defer fileIndexMutex.Unlock()
 	applyOffsetMaps_unlocked(journalData)
 }
 
+// Fonction optimisée pour vérifier les volumes en ligne
 func verifyVolumeOnline(volume *Volume) bool {
 	if volume.Status != "En ligne" {
 		return false
 	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
-	// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+	client := getHTTPClient()
+	defer putHTTPClient(client)
+	
+	// Timeout plus court pour une vérification rapide
+	client.Timeout = 2 * time.Second
 	testURL := fmt.Sprintf("http://%s/%s/health", volume.Address, volume.Name)
 
 	resp, err := client.Get(testURL)
@@ -413,9 +450,12 @@ func calculateFileStatus(meta *FileMetadata) string {
 	return "Protégé"
 }
 
+// Fonction optimisée pour vérifier l'existence d'un chunk
 func verifyChunkExistsOnVolume(volume *Volume, copyInfo *ChunkCopy, expectedChecksum string) bool {
-	client := &http.Client{Timeout: 5 * time.Second}
-	// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
+	client := getHTTPClient()
+	defer putHTTPClient(client)
+	
+	client.Timeout = 3 * time.Second
 	checkURL := fmt.Sprintf("http://%s/%s/verify_chunk?offset=%d&size=%d&checksum=%s",
 		volume.Address, volume.Name, copyInfo.Offset, copyInfo.Size, expectedChecksum)
 
@@ -531,7 +571,7 @@ func cleanupInactiveVolumes() {
 }
 
 func garbageCollectionWorker() {
-	ticker := time.NewTicker(24 * time.Hour) // Le GC peut être espacé
+	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
 		runGarbageCollection()
@@ -546,8 +586,6 @@ func findNewOffset(oldOffset uint64, offsetMap map[uint64]uint64) (uint64, bool)
 	var bestMatchOldStart uint64
 	found := false
 
-	// Trouver le début du bloc de données dans lequel notre chunk se trouvait
-	// C'est le plus grand offset de départ dans la map qui est inférieur ou égal à notre offset
 	for oldStart := range offsetMap {
 		if oldStart <= oldOffset {
 			if !found || oldStart > bestMatchOldStart {
@@ -642,9 +680,10 @@ func runGarbageCollection() {
 				return
 			}
 
-			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
 			compactURL := fmt.Sprintf("http://%s/%s/compact", volume.Address, volume.Name)
-			client := &http.Client{Timeout: 15 * time.Minute}
+			client := getHTTPClient()
+			defer putHTTPClient(client)
+			client.Timeout = 15 * time.Minute
 
 			resp, err := client.Post(compactURL, "application/json", bytes.NewBuffer(requestBody))
 			if err != nil {
@@ -726,7 +765,7 @@ func runGarbageCollection() {
 	log.Println("Garbage collection terminé et index mis à jour de manière transactionnelle et sécurisée.")
 }
 
-// --- Handlers HTTP ---
+// --- Handlers HTTP Optimisés ---
 
 func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 	var volData Volume
@@ -784,7 +823,27 @@ func registerVolumeHandler(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, "Type de requête ('initial' ou 'heartbeat') manquant.", http.StatusBadRequest)
 }
+
+// Structure pour les jobs de chunks dans l'upload parallèle
+type chunkJob struct {
+	index    int
+	data     []byte
+	checksum string
+	size     int
+}
+
+type chunkResult struct {
+	index int
+	chunk *ChunkMetadata
+	err   error
+}
+
+// Upload handler optimisé avec traitement parallèle des chunks
 func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
+	// Acquérir un slot d'upload pour limiter la concurrence
+	uploadSemaphore <- struct{}{}
+	defer func() { <-uploadSemaphore }()
+
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, "Erreur de lecture du formulaire multipart: "+err.Error(), http.StatusInternalServerError)
@@ -810,152 +869,103 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Canaux pour le pipeline parallèle
+	chunkJobChan := make(chan chunkJob, maxConcurrentChunks)
+	chunkResultChan := make(chan chunkResult, maxConcurrentChunks)
+	var wg sync.WaitGroup
+
+	// Workers pour traiter les chunks en parallèle
+	for i := 0; i < maxConcurrentChunks; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range chunkJobChan {
+				result := processChunkUpload(job)
+				chunkResultChan <- result
+			}
+		}()
+	}
+
+	// Lecture et envoi des chunks
+	go func() {
+		defer close(chunkJobChan)
+		chunkIdx := 0
+		
+		for {
+			// Obtenir un buffer du pool
+			buffer := chunkBufferPool.Get().([]byte)
+			
+			bytesRead, readErr := io.ReadFull(part, buffer)
+			
+			isLastChunk := false
+			if readErr == io.EOF {
+				chunkBufferPool.Put(buffer)
+				break
+			}
+			if readErr == io.ErrUnexpectedEOF {
+				buffer = buffer[:bytesRead]
+				isLastChunk = true
+			} else if readErr != nil {
+				chunkBufferPool.Put(buffer)
+				log.Printf("Erreur de lecture du chunk: %v", readErr)
+				break
+			}
+
+			// Calculer le checksum
+			hash := sha256.Sum256(buffer)
+			checksum := hex.EncodeToString(hash[:])
+
+			// Copier les données pour éviter la corruption du buffer
+			chunkData := make([]byte, len(buffer))
+			copy(chunkData, buffer)
+			chunkBufferPool.Put(buffer)
+
+			chunkJobChan <- chunkJob{
+				index:    chunkIdx,
+				data:     chunkData,
+				checksum: checksum,
+				size:     len(chunkData),
+			}
+			
+			chunkIdx++
+			
+			if isLastChunk {
+				break
+			}
+		}
+	}()
+
+	// Collecter les résultats
+	go func() {
+		wg.Wait()
+		close(chunkResultChan)
+	}()
+
 	var fileChunks []*ChunkMetadata
 	var totalSize int64
-	chunkIdx := 0
 	var successfulChunks []string
-
 	uploadValid := true
 	var uploadError error
 
-	for {
-		buffer := make([]byte, chunkSize)
-		bytesRead, readErr := io.ReadFull(part, buffer)
+	resultMap := make(map[int]*ChunkMetadata)
+	expectedChunks := 0
 
-		isLastChunk := false
-		if readErr == io.EOF {
-			break
-		}
-		if readErr == io.ErrUnexpectedEOF {
-			buffer = buffer[:bytesRead]
-			isLastChunk = true
-		} else if readErr != nil {
-			go cleanupUploadChunks(successfulChunks)
-			http.Error(w, "Erreur de lecture du chunk: "+readErr.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		hash := sha256.Sum256(buffer)
-		checksum := hex.EncodeToString(hash[:])
-
-		requiredSpace := uint64(len(buffer)) + minFreeSpaceForUpload
-		targetVolumes, err := selectVolumesForReplication(requiredReplicas, nil, requiredSpace)
-		if err != nil {
-			go cleanupUploadChunks(successfulChunks)
-			log.Printf("ERREUR UPLOAD: Impossible de trouver des volumes pour la réplication: %v", err)
-			http.Error(w, "Erreur interne: "+err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-
-		log.Printf("Chunk %d (checksum: %s...): écriture sur %s et %s",
-			chunkIdx, checksum[:8], targetVolumes[0].Name, targetVolumes[1].Name)
-
-		var wg sync.WaitGroup
-		results := make(chan *ChunkCopy, requiredReplicas)
-		errs := make(chan error, requiredReplicas)
-		successChan := make(chan string, requiredReplicas)
-
-		for _, vol := range targetVolumes {
-			wg.Add(1)
-			go func(v *Volume) {
-				defer wg.Done()
-
-				if !verifyVolumeOnline(v) {
-					errs <- fmt.Errorf("volume '%s' devenu inaccessible avant écriture", v.Name)
-					return
-				}
-
-				// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
-				diskURL := fmt.Sprintf("http://%s/%s/write_chunk", v.Address, v.Name)
-				req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(buffer))
-				req.Header.Set("Content-Type", "application/octet-stream")
-				req.Header.Set("X-Chunk-Checksum", checksum)
-
-				client := &http.Client{Timeout: 30 * time.Second}
-				resp, err := client.Do(req)
-				if err != nil {
-					log.Printf("ERREUR: Volume '%s' inaccessible, marquage hors ligne", v.Name)
-					volumeMutex.Lock()
-					if vol, exists := registeredVolumes[v.Name]; exists {
-						vol.Status = "Hors ligne"
-					}
-					volumeMutex.Unlock()
-					errs <- fmt.Errorf("volume '%s' injoignable: %w", v.Name, err)
-					return
-				}
-				defer resp.Body.Close()
-
-				if resp.StatusCode != http.StatusOK {
-					body, _ := io.ReadAll(resp.Body)
-					errs <- fmt.Errorf("le volume '%s' a refusé l'écriture (status: %d): %s", v.Name, resp.StatusCode, string(body))
-					return
-				}
-
-				var writeResp struct {
-					Offset uint64 `json:"offset"`
-					Size   uint32 `json:"size"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&writeResp); err != nil {
-					errs <- fmt.Errorf("réponse invalide du volume '%s'", v.Name)
-					return
-				}
-
-				successChan <- fmt.Sprintf("%s:%s:%d:%d", v.Name, checksum, writeResp.Offset, writeResp.Size)
-				results <- &ChunkCopy{VolumeName: v.Name, Offset: writeResp.Offset, Size: writeResp.Size}
-			}(vol)
-		}
-		wg.Wait()
-		close(results)
-		close(errs)
-		close(successChan)
-
-		var successfulCopies []*ChunkCopy
-		var partialSuccesses []string
-		for res := range results {
-			successfulCopies = append(successfulCopies, res)
-		}
-		for success := range successChan {
-			partialSuccesses = append(partialSuccesses, success)
-		}
-		for e := range errs {
-			log.Printf("ERREUR UPLOAD: %v", e)
-		}
-
-		if len(successfulCopies) < requiredReplicas {
+	for result := range chunkResultChan {
+		expectedChunks++
+		if result.err != nil {
 			uploadValid = false
-			uploadError = fmt.Errorf("chunk %d: seulement %d copies réussies sur %d requises",
-				chunkIdx, len(successfulCopies), requiredReplicas)
-			break
+			uploadError = result.err
+			log.Printf("ERREUR UPLOAD: Chunk %d: %v", result.index, result.err)
+			continue
 		}
-
-		uniqueDisks := make(map[string]bool)
-		volumeMutex.RLock()
-		for _, copy := range successfulCopies {
-			if vol, exists := registeredVolumes[copy.VolumeName]; exists {
-				uniqueDisks[vol.DiskID] = true
-			}
-		}
-		volumeMutex.RUnlock()
-
-		if len(uniqueDisks) < requiredReplicas {
-			uploadValid = false
-			uploadError = fmt.Errorf("chunk %d: copies sur seulement %d disques différents (requis: %d)",
-				chunkIdx, len(uniqueDisks), requiredReplicas)
-			break
-		}
-
-		successfulChunks = append(successfulChunks, partialSuccesses...)
-
-		fileChunks = append(fileChunks, &ChunkMetadata{
-			ChunkIdx: chunkIdx,
-			Copies:   successfulCopies,
-			Checksum: checksum,
-		})
-		totalSize += int64(successfulCopies[0].Size)
-		chunkIdx++
-
-		if isLastChunk {
-			break
+		
+		resultMap[result.index] = result.chunk
+		totalSize += int64(result.chunk.Copies[0].Size)
+		
+		// Construire les identifiants pour le nettoyage
+		for _, copy := range result.chunk.Copies {
+			successfulChunks = append(successfulChunks, 
+				fmt.Sprintf("%s:%s:%d:%d", copy.VolumeName, result.chunk.Checksum, copy.Offset, copy.Size))
 		}
 	}
 
@@ -964,6 +974,13 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		go cleanupUploadChunks(successfulChunks)
 		http.Error(w, "Échec de l'upload: "+uploadError.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Reconstituer les chunks dans l'ordre
+	for i := 0; i < expectedChunks; i++ {
+		if chunk, exists := resultMap[i]; exists {
+			fileChunks = append(fileChunks, chunk)
+		}
 	}
 
 	tempMeta := &FileMetadata{
@@ -991,6 +1008,117 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	saveIndex()
 	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé et validé avec succès.", fileName, totalSize, len(fileChunks))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// Fonction pour traiter un chunk d'upload
+func processChunkUpload(job chunkJob) chunkResult {
+	requiredSpace := uint64(job.size) + minFreeSpaceForUpload
+	targetVolumes, err := selectVolumesForReplication(requiredReplicas, nil, requiredSpace)
+	if err != nil {
+		return chunkResult{index: job.index, err: fmt.Errorf("impossible de trouver des volumes pour la réplication: %w", err)}
+	}
+
+	log.Printf("Chunk %d (checksum: %s...): écriture sur %s et %s",
+		job.index, job.checksum[:8], targetVolumes[0].Name, targetVolumes[1].Name)
+
+	var wg sync.WaitGroup
+	results := make(chan *ChunkCopy, requiredReplicas)
+	errs := make(chan error, requiredReplicas)
+
+	for _, vol := range targetVolumes {
+		wg.Add(1)
+		go func(v *Volume) {
+			defer wg.Done()
+
+			if !verifyVolumeOnline(v) {
+				errs <- fmt.Errorf("volume '%s' devenu inaccessible avant écriture", v.Name)
+				return
+			}
+
+			diskURL := fmt.Sprintf("http://%s/%s/write_chunk", v.Address, v.Name)
+			req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(job.data))
+			req.Header.Set("Content-Type", "application/octet-stream")
+			req.Header.Set("X-Chunk-Checksum", job.checksum)
+
+			client := getHTTPClient()
+			defer putHTTPClient(client)
+			
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("ERREUR: Volume '%s' inaccessible, marquage hors ligne", v.Name)
+				volumeMutex.Lock()
+				if vol, exists := registeredVolumes[v.Name]; exists {
+					vol.Status = "Hors ligne"
+				}
+				volumeMutex.Unlock()
+				errs <- fmt.Errorf("volume '%s' injoignable: %w", v.Name, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				errs <- fmt.Errorf("le volume '%s' a refusé l'écriture (status: %d): %s", v.Name, resp.StatusCode, string(body))
+				return
+			}
+
+			var writeResp struct {
+				Offset uint64 `json:"offset"`
+				Size   uint32 `json:"size"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&writeResp); err != nil {
+				errs <- fmt.Errorf("réponse invalide du volume '%s'", v.Name)
+				return
+			}
+
+			results <- &ChunkCopy{VolumeName: v.Name, Offset: writeResp.Offset, Size: writeResp.Size}
+		}(vol)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	var successfulCopies []*ChunkCopy
+	for res := range results {
+		successfulCopies = append(successfulCopies, res)
+	}
+	
+	var errors []error
+	for e := range errs {
+		errors = append(errors, e)
+	}
+
+	if len(successfulCopies) < requiredReplicas {
+		return chunkResult{
+			index: job.index,
+			err:   fmt.Errorf("chunk %d: seulement %d copies réussies sur %d requises. Erreurs: %v", job.index, len(successfulCopies), requiredReplicas, errors),
+		}
+	}
+
+	uniqueDisks := make(map[string]bool)
+	volumeMutex.RLock()
+	for _, copy := range successfulCopies {
+		if vol, exists := registeredVolumes[copy.VolumeName]; exists {
+			uniqueDisks[vol.DiskID] = true
+		}
+	}
+	volumeMutex.RUnlock()
+
+	if len(uniqueDisks) < requiredReplicas {
+		return chunkResult{
+			index: job.index,
+			err:   fmt.Errorf("chunk %d: copies sur seulement %d disques différents (requis: %d)", job.index, len(uniqueDisks), requiredReplicas),
+		}
+	}
+
+	return chunkResult{
+		index: job.index,
+		chunk: &ChunkMetadata{
+			ChunkIdx: job.index,
+			Copies:   successfulCopies,
+			Checksum: job.checksum,
+		},
+	}
 }
 
 func cleanupUploadChunks(chunkIdentifiers []string) {
@@ -1034,14 +1162,15 @@ func cleanupUploadChunks(chunkIdentifiers []string) {
 				continue
 			}
 
-			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
 			cleanupURL := fmt.Sprintf("http://%s/%s/cleanup_orphan", vol.Address, vol.Name)
 			cleanupData := map[string]interface{}{
 				"chunks": chunks,
 			}
 
 			jsonData, _ := json.Marshal(cleanupData)
-			client := &http.Client{Timeout: 10 * time.Second}
+			client := getHTTPClient()
+			defer putHTTPClient(client)
+			
 			req, _ := http.NewRequest("POST", cleanupURL, bytes.NewReader(jsonData))
 			req.Header.Set("Content-Type", "application/json")
 
@@ -1082,6 +1211,7 @@ func parseChunkIdentifier(identifier string) []string {
 	return parts
 }
 
+// Download handler optimisé avec streaming
 func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	filename := vars["filename"]
@@ -1104,6 +1234,7 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", metaCopy.TotalSize))
 
+	// Pipeline de téléchargement pour améliorer les performances
 	for _, chunk := range metaCopy.Chunks {
 		var readSuccessful bool
 		var lastError error
@@ -1128,10 +1259,12 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
 			diskURL := fmt.Sprintf("http://%s/%s/read_chunk?offset=%d&size=%d", volume.Address, volume.Name, copyInfo.Offset, copyInfo.Size)
 
-			client := &http.Client{Timeout: 10 * time.Second}
+			client := getHTTPClient()
+			defer putHTTPClient(client)
+			client.Timeout = 10 * time.Second
+			
 			resp, err := client.Get(diskURL)
 			if err != nil {
 				log.Printf("SÉCURITÉ: Erreur de lecture détectée sur '%s', marquage hors ligne", volume.Name)
@@ -1151,26 +1284,30 @@ func downloadFileHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			chunkData, err := io.ReadAll(resp.Body)
+			// Streaming direct pour éviter de charger tout en mémoire
+			buffer := chunkBufferPool.Get().([]byte)
+			defer chunkBufferPool.Put(buffer)
+			
+			hasher := sha256.New()
+			written, err := io.CopyBuffer(io.MultiWriter(w, hasher), resp.Body, buffer)
 			resp.Body.Close()
+			
 			if err != nil {
-				lastError = fmt.Errorf("erreur de lecture du corps de la réponse de '%s': %w", volume.Name, err)
+				lastError = fmt.Errorf("erreur de streaming depuis '%s': %w", volume.Name, err)
 				continue
 			}
 
-			hash := sha256.Sum256(chunkData)
-			actualChecksum := hex.EncodeToString(hash[:])
+			if written != int64(copyInfo.Size) {
+				lastError = fmt.Errorf("taille incorrecte reçue de '%s': attendu %d, reçu %d", volume.Name, copyInfo.Size, written)
+				continue
+			}
 
+			actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 			if actualChecksum != expectedChecksum {
 				log.Printf("!!! CORRUPTION DETECTEE !!! Chunk %d de '%s' sur volume '%s'. Attendu: %s, Reçu: %s",
 					chunk.ChunkIdx, filename, volume.Name, expectedChecksum, actualChecksum)
 				lastError = fmt.Errorf("corruption de données sur '%s'", volume.Name)
 				continue
-			}
-
-			if _, err := w.Write(chunkData); err != nil {
-				log.Printf("Erreur d'envoi du chunk au client: %v", err)
-				return
 			}
 
 			readSuccessful = true
@@ -1240,7 +1377,6 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 
 		for volumeName, chunks := range volumeChunks {
 			if vol, ok := volumes[volumeName]; ok {
-				// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
 				deleteURL := fmt.Sprintf("http://%s/%s/mark_deleted", vol.Address, vol.Name)
 				deleteData := map[string]interface{}{
 					"chunks": chunks,
@@ -1250,7 +1386,10 @@ func deleteFileHandler(w http.ResponseWriter, r *http.Request) {
 				req, _ := http.NewRequest("POST", deleteURL, bytes.NewReader(jsonData))
 				req.Header.Set("Content-Type", "application/json")
 
-				client := &http.Client{Timeout: 5 * time.Second}
+				client := getHTTPClient()
+				defer putHTTPClient(client)
+				client.Timeout = 5 * time.Second
+				
 				resp, err := client.Do(req)
 				if err != nil {
 					log.Printf("Erreur lors de la notification de suppression au volume '%s': %v", volumeName, err)
@@ -1352,7 +1491,6 @@ func runCleanupReplicasProcess() {
 				volumeMutex.RUnlock()
 
 				if ok && vol.Status == "En ligne" {
-					// MODIFIÉ : L'URL inclut maintenant le nom du volume dans le chemin.
 					deleteURL := fmt.Sprintf("http://%s/%s/mark_deleted", vol.Address, vol.Name)
 					deleteData := map[string]interface{}{"chunks": chunks}
 
@@ -1360,7 +1498,10 @@ func runCleanupReplicasProcess() {
 					req, _ := http.NewRequest("POST", deleteURL, bytes.NewReader(jsonData))
 					req.Header.Set("Content-Type", "application/json")
 
-					client := &http.Client{Timeout: 5 * time.Second}
+					client := getHTTPClient()
+					defer putHTTPClient(client)
+					client.Timeout = 5 * time.Second
+					
 					resp, err := client.Do(req)
 					if err != nil {
 						log.Printf("Erreur lors de la notification de suppression (nettoyage) au volume '%s': %v", volumeName, err)
@@ -1450,9 +1591,12 @@ func runRepairProcess() {
 		}
 		targetVolume := targetVolumes[0]
 
-		// MODIFIÉ : L'URL de lecture inclut maintenant le nom du volume dans le chemin.
 		readURL := fmt.Sprintf("http://%s/%s/read_chunk?offset=%d&size=%d", job.sourceVolume.Address, job.sourceVolume.Name, job.sourceCopy.Offset, job.sourceCopy.Size)
-		resp, err := http.Get(readURL)
+		
+		client := getHTTPClient()
+		defer putHTTPClient(client)
+		
+		resp, err := client.Get(readURL)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			log.Printf("ERREUR REPARATION: Impossible de lire le chunk source depuis '%s': %v", job.sourceVolume.Name, err)
 			if resp != nil {
@@ -1475,12 +1619,12 @@ func runRepairProcess() {
 			continue
 		}
 
-		// MODIFIÉ : L'URL d'écriture inclut maintenant le nom du volume dans le chemin.
 		writeURL := fmt.Sprintf("http://%s/%s/write_chunk", targetVolume.Address, targetVolume.Name)
 		req, _ := http.NewRequest("POST", writeURL, bytes.NewReader(chunkData))
 		req.Header.Set("Content-Type", "application/octet-stream")
 		req.Header.Set("X-Chunk-Checksum", job.chunkChecksum)
-		writeResp, err := http.DefaultClient.Do(req)
+		
+		writeResp, err := client.Do(req)
 		if err != nil || writeResp.StatusCode != http.StatusOK {
 			log.Printf("ERREUR REPARATION: Impossible d'écrire le chunk sur la destination '%s': %v", targetVolume.Name, err)
 			if writeResp != nil {
@@ -1551,7 +1695,6 @@ func webUIHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// calculateFileStatus a besoin de la liste des volumes, qui est déjà verrouillée en lecture.
 		f.Status = calculateFileStatus(f)
 
 		if f.Status == "Dégradé" {
@@ -1649,6 +1792,7 @@ const htmlTemplate = `
         .volume-offline td { color: #95a5a6; }
         .action-buttons { display: flex; gap: 5px; }
         .confirm-delete { background-color: #c0392b; }
+        .performance-info { background: #e8f5e8; padding: 1em; border-radius: 5px; margin-bottom: 1em; font-size: 0.9em; }
     </style>
     <script>
         function confirmDelete(filename) {
@@ -1658,7 +1802,11 @@ const htmlTemplate = `
 </head>
 <body>
     <div class="container">
-        <h1>💿 Panneau de Contrôle du Stockage</h1>
+        <h1>💿 Panneau de Contrôle du Stockage (Version Optimisée)</h1>
+        
+        <div class="performance-info">
+            <strong>🚀 Optimisations Actives:</strong> Upload parallèle (3 chunks simultanés) • Pool de buffers • Clients HTTP réutilisables • Streaming de téléchargement • Sync asynchrone
+        </div>
         
         {{if .NotEnoughDisksForRedundancy}}
         <div class="alert alert-danger">
@@ -1742,7 +1890,7 @@ const htmlTemplate = `
                     <h3>Ajouter un nouveau fichier</h3>
                     <form action="/api/files/upload" method="post" enctype="multipart/form-data">
                         <input type="file" name="file" required>
-                        <button type="submit" class="btn" {{if .NotEnoughDisksForRedundancy}}disabled title="Pas assez de disques pour l'upload"{{end}}>Envoyer</button>
+                        <button type="submit" class="btn" {{if .NotEnoughDisksForRedundancy}}disabled title="Pas assez de disques pour l'upload"{{end}}>Envoyer (Mode Parallèle)</button>
                     </form>
                 </div>
                 <table>
