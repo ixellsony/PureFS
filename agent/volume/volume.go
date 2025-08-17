@@ -125,36 +125,27 @@ func New(cfg Config) (*Volume, error) {
 	return v, nil
 }
 
-// Initialiser le pool de descripteurs de fichiers
+// Initialiser le pool de descripteurs de fichiers (VERSION SIMPLIFIÉE)
 func (v *Volume) initFileHandlePool() error {
-	const poolSize = 4 // 4 descripteurs pour les opérations parallèles
-	v.fileHandles = make([]*os.File, poolSize)
+	// CORRECTION TEMPORAIRE: Désactiver le pool complexe qui peut causer des conflits
+	// Nous utiliserons des descripteurs dédiés pour chaque opération
+	v.fileHandles = make([]*os.File, 1) // Un seul handle de référence
 	
-	for i := 0; i < poolSize; i++ {
-		file, err := os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
-		if err != nil {
-			// Nettoyer les descripteurs déjà ouverts en cas d'erreur
-			for j := 0; j < i; j++ {
-				if v.fileHandles[j] != nil {
-					v.fileHandles[j].Close()
-				}
-			}
-			return fmt.Errorf("impossible d'ouvrir le descripteur de fichier %d: %w", i, err)
-		}
-		v.fileHandles[i] = file
+	file, err := os.OpenFile(v.volumePath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return fmt.Errorf("impossible d'ouvrir le descripteur de fichier: %w", err)
 	}
+	v.fileHandles[0] = file
 	
 	return nil
 }
 
-// Obtenir un descripteur de fichier du pool
+// Obtenir un descripteur de fichier du pool (VERSION SIMPLIFIÉE)
 func (v *Volume) getFileHandle() *os.File {
-	v.filePoolMutex.Lock()
-	defer v.filePoolMutex.Unlock()
-	
-	handle := v.fileHandles[v.currentHandle]
-	v.currentHandle = (v.currentHandle + 1) % len(v.fileHandles)
-	return handle
+	// CORRECTION: Retourner le handle de référence (les handlers utilisent maintenant leurs propres descripteurs)
+	v.filePoolMutex.RLock()
+	defer v.filePoolMutex.RUnlock()
+	return v.fileHandles[0]
 }
 
 // Start lance les tâches de fond du volume (heartbeats). C'est une méthode non-bloquante.
@@ -508,27 +499,11 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Utiliser un buffer du pool pour la lecture
-	buffer := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buffer)
-
-	// Lire les données avec un buffer optimisé
-	var chunkData []byte
-	var totalRead int
-	
-	for {
-		n, err := r.Body.Read(buffer)
-		if n > 0 {
-			chunkData = append(chunkData, buffer[:n]...)
-			totalRead += n
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
-			return
-		}
+	// CORRECTION: Lire tout le body en une fois pour éviter les corruptions
+	chunkData, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Erreur lors de la lecture du chunk", http.StatusInternalServerError)
+		return
 	}
 
 	if v.getFreeSpaceBytes() < uint64(len(chunkData)) {
@@ -545,16 +520,21 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Obtenir un descripteur de fichier du pool
-	handle := v.getFileHandle()
+	// CORRECTION: Ouvrir un nouveau descripteur dédié pour l'écriture
+	file, err := os.OpenFile(v.volumePath, os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		http.Error(w, "Erreur d'ouverture du fichier", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
 	
-	offset, err := handle.Seek(0, io.SeekEnd)
+	offset, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		http.Error(w, "Erreur interne du disque", http.StatusInternalServerError)
 		return
 	}
 
-	bytesWritten, err := handle.Write(chunkData)
+	bytesWritten, err := file.Write(chunkData)
 	if err != nil {
 		// En cas d'erreur, marquer comme orphelin
 		v.orphanMutex.Lock()
@@ -570,8 +550,10 @@ func (v *Volume) WriteChunkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Demander une synchronisation asynchrone au lieu d'un sync bloquant
-	v.requestSync()
+	// CORRECTION: Sync immédiat pour garantir l'écriture
+	if err := file.Sync(); err != nil {
+		log.Printf("ATTENTION: Sync échoué (vol %s): %v", v.config.Name, err)
+	}
 
 	response := map[string]interface{}{"offset": offset, "size": uint32(bytesWritten)}
 	w.Header().Set("Content-Type", "application/json")
@@ -595,22 +577,41 @@ func (v *Volume) ReadChunkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	v.deletedMutex.RUnlock()
 
-	// Obtenir un descripteur de fichier du pool
-	handle := v.getFileHandle()
+	// CORRECTION: Ouvrir un nouveau descripteur de fichier dédié pour éviter les conflits
+	file, err := os.Open(v.volumePath)
+	if err != nil {
+		http.Error(w, "Erreur d'ouverture du fichier", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 
-	// Utiliser un buffer du pool pour la lecture
-	buffer := bufferPool.Get().([]byte)
-	defer bufferPool.Put(buffer)
-
-	// Streaming direct pour éviter de charger tout en mémoire
-	reader := io.NewSectionReader(handle, offset, size)
-	_, err := io.CopyBuffer(w, reader, buffer)
+	// CORRECTION: Lire tout le chunk en une fois pour éviter EOF
+	chunkData := make([]byte, size)
+	n, err := file.ReadAt(chunkData, offset)
+	if err != nil && err != io.EOF {
+		log.Printf("Erreur de lecture du chunk (vol %s): %v", v.config.Name, err)
+		http.Error(w, "Erreur de lecture", http.StatusInternalServerError)
+		return
+	}
 	
+	if int64(n) != size {
+		log.Printf("Lecture incomplète (vol %s): attendu %d bytes, lu %d bytes", v.config.Name, size, n)
+		http.Error(w, "Lecture incomplète", http.StatusInternalServerError)
+		return
+	}
+
+	// CORRECTION: Écrire tout le chunk en une fois
+	written, err := w.Write(chunkData[:n])
 	if err != nil {
-		log.Printf("Erreur de lecture/streaming du chunk (vol %s): %v", v.config.Name, err)
+		log.Printf("Erreur d'écriture de la réponse (vol %s): %v", v.config.Name, err)
+		return
+	}
+	
+	if written != n {
+		log.Printf("Écriture incomplète de la réponse (vol %s): attendu %d bytes, écrit %d bytes", v.config.Name, n, written)
 	}
 }
 
