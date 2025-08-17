@@ -911,13 +911,26 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Début de l'upload pour: %s", fileName)
 
-	fileIndexMutex.RLock()
-	_, exists := fileIndex[fileName]
-	fileIndexMutex.RUnlock()
-	if exists {
-		http.Error(w, "Un fichier avec ce nom existe déjà.", http.StatusConflict)
-		return
-	}
+	// NOUVEAU CODE - Vérification atomique et réservation
+fileIndexMutex.Lock()
+if _, exists := fileIndex[fileName]; exists {
+    fileIndexMutex.Unlock()
+    http.Error(w, "Un fichier avec ce nom existe déjà.", http.StatusConflict)
+    return
+}
+
+// Réserver immédiatement le nom avec un placeholder
+reservationMeta := &FileMetadata{
+    FileName:   fileName,
+    TotalSize:  0,
+    UploadDate: time.Now(),
+    Chunks:     nil,
+    Status:     "uploading", // Statut temporaire
+}
+fileIndex[fileName] = reservationMeta
+fileIndexMutex.Unlock()
+
+log.Printf("Nom de fichier '%s' réservé pour upload", fileName)
 
 	// Canaux pour le pipeline parallèle
 	chunkJobChan := make(chan chunkJob, maxConcurrentChunks)
@@ -946,20 +959,24 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 			buffer := chunkBufferPool.Get().([]byte)
 			
 			bytesRead, readErr := io.ReadFull(part, buffer)
-			
-			isLastChunk := false
-			if readErr == io.EOF {
-				chunkBufferPool.Put(buffer)
-				break
-			}
-			if readErr == io.ErrUnexpectedEOF {
-				buffer = buffer[:bytesRead]
-				isLastChunk = true
-			} else if readErr != nil {
-				chunkBufferPool.Put(buffer)
-				log.Printf("Erreur de lecture du chunk: %v", readErr)
-				break
-			}
+
+isLastChunk := false
+if readErr == io.EOF {
+    chunkBufferPool.Put(buffer)
+    break
+}
+if readErr == io.ErrUnexpectedEOF {
+    // CORRECTION: Créer un nouveau buffer de la taille exacte
+    exactBuffer := make([]byte, bytesRead)
+    copy(exactBuffer, buffer[:bytesRead])
+    chunkBufferPool.Put(buffer)
+    buffer = exactBuffer
+    isLastChunk = true
+} else if readErr != nil {
+    chunkBufferPool.Put(buffer)
+    log.Printf("Erreur de lecture du chunk: %v", readErr)
+    break
+}
 
 			// Calculer le checksum
 			hash := sha256.Sum256(buffer)
@@ -1033,27 +1050,37 @@ func uploadFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tempMeta := &FileMetadata{
-		FileName:   fileName,
-		TotalSize:  totalSize,
-		UploadDate: time.Now(),
-		Chunks:     fileChunks,
-	}
-	fileIndexMutex.Lock()
-	fileIndex[fileName] = tempMeta
-	fileIndexMutex.Unlock()
+	// NOUVEAU CODE - Mise à jour de la réservation existante
+fileIndexMutex.Lock()
+if existingMeta, exists := fileIndex[fileName]; exists {
+    // Mettre à jour la réservation avec les vraies données
+    existingMeta.TotalSize = totalSize
+    existingMeta.Chunks = fileChunks
+    existingMeta.Status = "" // Supprimer le statut temporaire
+} else {
+    // Cas improbable mais sécurisé
+    log.Printf("ATTENTION: Réservation perdue pour '%s', recréation", fileName)
+    fileIndex[fileName] = &FileMetadata{
+        FileName:   fileName,
+        TotalSize:  totalSize,
+        UploadDate: time.Now(),
+        Chunks:     fileChunks,
+    }
+}
+fileIndexMutex.Unlock()
 
 	if err := validateUploadedFileWithRetry(fileName); err != nil {
-		log.Printf("ERREUR VALIDATION: Upload de '%s' échoue à la validation: %v", fileName, err)
+    log.Printf("ERREUR VALIDATION: Upload de '%s' échoue à la validation: %v", fileName, err)
 
-		fileIndexMutex.Lock()
-		delete(fileIndex, fileName)
-		fileIndexMutex.Unlock()
+    // NOUVEAU CODE - Nettoyer la réservation en cas d'échec
+    fileIndexMutex.Lock()
+    delete(fileIndex, fileName)
+    fileIndexMutex.Unlock()
 
-		go cleanupUploadChunks(successfulChunks)
-		http.Error(w, "Échec de la validation: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
+    go cleanupUploadChunks(successfulChunks)
+    http.Error(w, "Échec de la validation: "+err.Error(), http.StatusInternalServerError)
+    return
+}
 
 	saveIndex()
 	log.Printf("Fichier %s (taille: %d, chunks: %d) uploadé et validé avec succès.", fileName, totalSize, len(fileChunks))
@@ -1084,12 +1111,21 @@ func processChunkUpload(job chunkJob) chunkResult {
 		// if !verifyVolumeOnline(v) { ... } <- SUPPRIMER CETTE VÉRIFICATION
 
 		diskURL := fmt.Sprintf("http://%s/%s/write_chunk", v.Address, v.Name)
-		req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(job.data))
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("X-Chunk-Checksum", job.checksum)
+		// DANS processChunkUpload, APRÈS la création de la requête HTTP
+req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(job.data))
+req.Header.Set("Content-Type", "application/octet-stream")
+req.Header.Set("X-Chunk-Checksum", job.checksum)
+req.Header.Set("Content-Length", fmt.Sprintf("%d", len(job.data))) // NOUVEAU: Forcer la taille
 
-		client := getHTTPClient()
-		defer putHTTPClient(client)
+client := getHTTPClient()
+defer putHTTPClient(client)
+
+// NOUVEAU: Timeout plus long pour les gros chunks
+if len(job.data) > 50*1024*1024 { // Plus de 50MB
+    client.Timeout = 120 * time.Second
+} else {
+    client.Timeout = 30 * time.Second
+}
 		
 		resp, err := client.Do(req)
 		if err != nil {
