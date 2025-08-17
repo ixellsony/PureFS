@@ -53,10 +53,10 @@ func setupOptimizedHTTPServer(listenAddr string, handler http.Handler) *http.Ser
 		Addr:    listenAddr,
 		Handler: handler,
 		
-		// Timeouts optimisés pour les gros transferts
+		// CORRECTION: Timeouts augmentés pour éviter les déconnexions sous charge
 		ReadTimeout:    60 * time.Second,  // Augmenté pour les gros chunks
 		WriteTimeout:   60 * time.Second,  // Augmenté pour les téléchargements
-		IdleTimeout:    120 * time.Second, // Connexions persistantes
+		IdleTimeout:    180 * time.Second, // CORRECTION: Augmenté de 120s à 180s
 		MaxHeaderBytes: 1 << 20,           // 1MB headers max
 	}
 	
@@ -328,3 +328,6 @@ func performanceMonitor() {
 		}
 	}
 }
+
+// Extension nécessaire pour le volume.go - ajouter cette méthode GetName()
+// (Note: Cette méthode devrait être ajoutée au package volume)
