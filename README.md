@@ -16,15 +16,16 @@ Une fois le serveur démarré, ouvrez votre navigateur à l'adresse `http://loca
 
 L'écran est divisé en deux parties principales :
 
-**À gauche : Les Volumes de Stockage**  
+**À gauche : Les Volumes de Stockage**
+
 Cette section liste tous les disques (ou plus précisément, les "volumes" de 30 Go) que le système connaît.
 
 *   **Disque Physique** : Un identifiant unique pour un disque dur physique. Plusieurs volumes peuvent appartenir au même disque.
 *   **Nom Volume** : Le nom unique du volume de 30 Go.
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
 *   **Statut** :
-    *   <span style="color: #27ae60;">**● En ligne**</span> : Le volume est connecté, sain et prêt à être utilisé.
-    *   <span style="color: #c0392b;">**● Hors ligne**</span> : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
+*   <span style="color: #27ae60;">**● En ligne**</span> : Le volume est connecté, sain et prêt à être utilisé.
+*   <span style="color: #c0392b;">**● Hors ligne**</span> : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
 
 **À droite : Les Fichiers Stockés**
 C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
