@@ -8,9 +8,6 @@ Cas 1 : Si deux copies ne peuvent pas être garanties lors d’un upload, l’op
 Cas 2 : Si un disque tombe en panne, les fichiers restés avec une seule copie sont automatiquement répliqués.  
 Cas 3 : Si un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
 
-➡️ **Une interface ultra-simple, aucune configuration complexe, une tolérance aux pannes automatique.**
-
-
 ## 🖥️ Interface Web
 
 Une fois le serveur démarré, ouvrez votre navigateur à l'adresse `http://localhost:8080`. Vous y trouverez le panneau de contrôle, qui est votre principal outil de gestion.
