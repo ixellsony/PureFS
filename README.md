@@ -12,7 +12,7 @@ Cas 3 : Si un disque est reconnecté, les doublons inutiles sont supprimés afin
 
 Une fois le serveur démarré, ouvrez votre navigateur à l'adresse `http://localhost:8080`. Vous y trouverez le panneau de contrôle, qui est votre principal outil de gestion.
 
-### 1. Comprendre l'affichage
+### 1. L'Affichage
 
 L'écran est divisé en deux parties principales :
 
@@ -31,7 +31,7 @@ L'écran est divisé en deux parties principales :
 *   <span style="color: #c0392b;">**✖ Indisponible**</span> : **Critique.** Plusieurs disques contenant les copies du fichier sont hors ligne. Le système n'a plus accès à une copie valide du fichier, qui ne peut donc plus être téléchargé.
 *   <span style="color: #3498db;">**ℹ️ Sur-protégé**</span> : **Information.** Le fichier a plus de copies que nécessaire. Cela peut arriver après une réparation si un disque revient en ligne. Ce n'est pas une erreur, mais une opportunité de libérer de l'espace.
 
-### 2. Les Actions Concrètes (Les Boutons)
+### 2. Les actions
 
 #### **Ajouter un nouveau fichier**
 -   **Action :** Cliquez sur "Choisir un fichier", sélectionnez un fichier sur votre ordinateur, puis cliquez sur "Envoyer".
