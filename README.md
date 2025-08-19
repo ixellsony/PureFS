@@ -21,7 +21,7 @@ L'écran est divisé en deux parties principales :
 *   **Disque Physique** : Un identifiant unique pour un disque dur physique. Plusieurs volumes peuvent appartenir au même disque.
 *   **Nom Volume** : Le nom unique du volume de 30 Go.
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
-*   **Statut** : En ligne / ors ligne.
+*   **Statut** : En ligne / hors ligne.
 
 **À droite : Les fichiers** : C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
 
