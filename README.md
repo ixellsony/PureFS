@@ -4,9 +4,9 @@
 
 Chaque fichier est toujours stocké en **deux exemplaires sur deux disques distincts**. Les disques peuvent être connectés sur n’importe quelle machine : il suffit de lancer un agent pour qu’ils soient intégrés au système.  
 
-Si deux copies ne peuvent pas être garanties lors d’un upload, l’opération est refusée.  
-En cas de panne, les fichiers restés avec une seule copie sont automatiquement répliqués.  
-Lorsqu’un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
+- Si deux copies ne peuvent pas être garanties lors d’un upload, l’opération est refusée.  
+- En cas de panne, les fichiers restés avec une seule copie sont automatiquement répliqués.  
+- Lorsqu’un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
 
 ➡️ **Une interface ultra-simple, aucune configuration complexe, une tolérance aux pannes automatique.**
 
