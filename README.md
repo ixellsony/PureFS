@@ -121,7 +121,7 @@ Utilisé par un agent de disque pour s'enregistrer ou envoyer un heartbeat au se
     *Exemple pour une machine gérant deux disques :*
     ```bash
     ./purefs_agent \
-      -disks="/mnt/stockage1,/mnt/stockage2" \
+      -disks="/mnt/disk1,/mnt/disk2" \
       -server="<IP_DU_SERVEUR>:8080" \
       -listen-addr="0.0.0.0:9000"
     ```
