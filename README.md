@@ -16,7 +16,7 @@ Une fois le serveur démarré, ouvrez votre navigateur à l'adresse `http://loca
 
 L'écran est divisé en deux parties principales :
 
-**À gauche : Les volumes** : Cette section liste tous les disques (ou plus précisément, les "volumes" de 30 Go) que le système connaît.
+**À gauche : Les volumes** : Cette section liste tous les volumes de 30 Go que le système connaît (sur un disque de 500Go vous aurez 16 volumes).
 
 *   **Disque Physique** : Un identifiant unique pour un disque dur physique. Plusieurs volumes peuvent appartenir au même disque.
 *   **Nom Volume** : Le nom unique du volume de 30 Go.
