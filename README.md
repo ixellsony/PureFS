@@ -24,8 +24,10 @@ Cette section liste tous les disques (ou plus précisément, les "volumes" de 30
 *   **Nom Volume** : Le nom unique du volume de 30 Go.
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
 *   **Statut** :
+
   <span style="color: #27ae60;">**● En ligne**</span> : Le volume est connecté, sain et prêt à être utilisé.
   <span style="color: #c0392b;">**● Hors ligne**</span> : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
+
 
 **À droite : Les fichiers stockés**
 C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
