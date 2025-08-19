@@ -24,7 +24,7 @@ L'écran est divisé en deux parties principales :
 *   **Statut** : En ligne / hors ligne.
 
 
-**Les fichiers** : C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
+**Les fichiers** : C’est la liste de tous vos fichiers avec leur statut.
 
 *   <span style="color: #27ae60;">**✔ Protégé**</span> : **État idéal.** Le fichier possède le nombre requis de copies (par défaut 2) sur des disques physiques différents. Il est en sécurité.
 *   <span style="color: #f39c12;">**⚠ Dégradé**</span> : **Attention.** Un disque est tombé en panne et une des copies du fichier est inaccessible. **Le fichier est toujours lisible** grâce à sa copie restante, mais il n'est plus protégé contre une nouvelle panne.
