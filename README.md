@@ -6,7 +6,7 @@ Chaque fichier est toujours stocké en **deux exemplaires sur deux disques disti
 
 Cas 1 : Si deux copies ne peuvent pas être garanties lors d’un upload, l’opération est refusée.  
 Cas 2 : Si un disque tombe en panne, les fichiers restés avec une seule copie sont automatiquement répliqués.  
-Cas 3 : Lorsqu’un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
+Cas 3 : Si un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
 
 ➡️ **Une interface ultra-simple, aucune configuration complexe, une tolérance aux pannes automatique.**
 
