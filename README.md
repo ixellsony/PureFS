@@ -21,11 +21,7 @@ L'écran est divisé en deux parties principales :
 *   **Disque Physique** : Un identifiant unique pour un disque dur physique. Plusieurs volumes peuvent appartenir au même disque.
 *   **Nom Volume** : Le nom unique du volume de 30 Go.
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
-*   **Statut** :
-
-  **En ligne** : Le volume est connecté, sain et prêt à être utilisé.  
-  **Hors ligne** : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
-
+*   **Statut** : En ligne/Hors ligne.
 
 **À droite : Les fichiers stockés**
 C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
