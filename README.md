@@ -23,6 +23,7 @@ L'écran est divisé en deux parties principales :
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
 *   **Statut** : En ligne / hors ligne.
 
+
 **À droite : Les fichiers** : C'est la liste de tous vos fichiers. La colonne la plus importante est **"Statut de Redondance"**.
 
 *   <span style="color: #27ae60;">**✔ Protégé**</span> : **État idéal.** Le fichier possède le nombre requis de copies (par défaut 2) sur des disques physiques différents. Il est en sécurité.
