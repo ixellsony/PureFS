@@ -1,6 +1,14 @@
 # 🌳 PureFS
 
-PureFS est un système de stockage distribué conçu spécifiquement pour permettre le remplacement à chaud des disques sans perte de données.
+**PureFS est un système de stockage distribué conçu pour être simple et résilient.**  
+Chaque fichier est toujours stocké en **deux exemplaires sur des disques distincts**. Les disques peuvent être connectés sur n’importe quelle machine : il suffit de lancer l’agent pour qu’ils soient intégrés au système.  
+
+Si deux copies ne peuvent pas être garanties lors d’un upload, l’opération est refusée.  
+En cas de panne, les fichiers restés avec une seule copie sont automatiquement répliqués.  
+Lorsqu’un disque est reconnecté, les doublons inutiles sont supprimés afin de conserver strictement deux copies par fichier.  
+
+➡️ **Une interface ultra-simple, aucune configuration complexe, une tolérance aux pannes automatique.**
+
 
 ## 🖥️ Interface Web
 
