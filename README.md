@@ -26,7 +26,7 @@ L'écran est divisé en deux parties principales :
 
 **Les fichiers** : C’est la liste de tous vos fichiers avec leur statut.
 
-*   <span style="color: #27ae60;">**✔ Protégé**</span> : **État idéal.** Le fichier possède le nombre requis de copies (par défaut 2) sur des disques physiques différents. Il est en sécurité.
+*   <span style="color: #27ae60;">**✔ Protégé**</span> : **État idéal.** Le fichier possède 2 copies sur deux disques physiques différents. Il est en sécurité.
 *   <span style="color: #f39c12;">**⚠ Dégradé**</span> : **Attention.** Un disque est tombé en panne et une des copies du fichier est inaccessible. **Le fichier est toujours lisible** grâce à sa copie restante, mais il n'est plus protégé contre une nouvelle panne.
 *   <span style="color: #c0392b;">**✖ Indisponible**</span> : **Critique.** Plusieurs disques contenant les copies du fichier sont hors ligne. Le système n'a plus accès à une copie valide du fichier, qui ne peut donc plus être téléchargé.
 *   <span style="color: #3498db;">**ℹ️ Sur-protégé**</span> : **Information.** Le fichier a plus de copies que nécessaire. Cela peut arriver après une réparation si un disque revient en ligne. Ce n'est pas une erreur, mais une opportunité de libérer de l'espace.
