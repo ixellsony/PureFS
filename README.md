@@ -23,8 +23,8 @@ L'écran est divisé en deux parties principales :
 *   **Espace Libre** : L'espace restant sur ce volume spécifique.
 *   **Statut** :
 
-  <span style="color: #27ae60;">**● En ligne**</span> : Le volume est connecté, sain et prêt à être utilisé.  
-  <span style="color: #c0392b;">**● Hors ligne**</span> : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
+  **En ligne** : Le volume est connecté, sain et prêt à être utilisé.  
+  **Hors ligne** : L'agent de disque de ce volume ne répond plus. Les données qu'il contient sont temporairement inaccessibles, mais ne sont pas perdues.
 
 
 **À droite : Les fichiers stockés**
