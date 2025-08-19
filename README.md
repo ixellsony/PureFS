@@ -109,13 +109,13 @@ Utilisé par un agent de disque pour s'enregistrer ou envoyer un heartbeat au se
 
 ## 🚀 Démarrage Rapide
 
-1.  **Lancer le Serveur Maître :**
+1.  **Lancer le serveur :**
     ```bash
     ./purefs_server
     ```
     Le serveur est maintenant accessible sur `http://localhost:8080`.
 
-2.  **Lancer un Agent de Disque :**
+2.  **Lancer un agent :**
     Lancez un agent pour chaque machine de stockage. Spécifiez les chemins des disques à utiliser et l'adresse du serveur. ⚠️ N’utilisez jamais deux emplacements différents sur le même disque dans votre commande, sinon le stockage sera mal calculé et pourrait être saturé.
 
     *Exemple pour une machine gérant deux disques :*
