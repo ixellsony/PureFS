@@ -1107,11 +1107,8 @@ func processChunkUpload(job chunkJob) chunkResult {
 	go func(v *Volume) {
 		defer wg.Done()
 
-		// CORRECTION: Ne plus vérifier avant écriture - écrire directement
-		// if !verifyVolumeOnline(v) { ... } <- SUPPRIMER CETTE VÉRIFICATION
-
 		diskURL := fmt.Sprintf("http://%s/%s/write_chunk", v.Address, v.Name)
-		// DANS processChunkUpload, APRÈS la création de la requête HTTP
+
 req, _ := http.NewRequest("POST", diskURL, bytes.NewReader(job.data))
 req.Header.Set("Content-Type", "application/octet-stream")
 req.Header.Set("X-Chunk-Checksum", job.checksum)
