@@ -1,7 +1,3 @@
-*test*  
-
-*test*
-
 # 🌳 PureFS
 
 **PureFS est un système de stockage distribué conçu pour être simple et résilient.**  
